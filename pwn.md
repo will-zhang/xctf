@@ -1,5 +1,4 @@
-# pwn
-## 新手练习区
+## pwn新手练习区
 ### get_shell
 题目：运行就能拿到shell呢，真的
 
@@ -116,3 +115,8 @@ def execute():
     sh.sendline(shellcode)
     sh.interactive()
 ````
+
+### guess_num
+题目：菜鸡在玩一个猜数字的游戏，但他无论如何都银不了，你能帮助他么
+
+思路：简单的栈溢出，覆盖产生随机数的种子变量，然后爆破随机数序列即可
