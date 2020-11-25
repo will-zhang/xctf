@@ -238,3 +238,9 @@ data = sh.recv(printfLen)
 print(data)
 sh.interactive()
 ```
+
+
+### 4. monkey
+题目：暂无
+
+思路：运行后得到一个类似nodejs的解释器，使用os.system('cat flag')得到flag。
